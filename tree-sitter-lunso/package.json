@@ -1,0 +1,11 @@
+{
+  "name": "tree-sitter-lunso",
+  "version": "0.1.0",
+  "description": "Tree-sitter grammar for the Lunso programming language",
+  "license": "MIT",
+  "main": "bindings/node",
+  "keywords": ["incremental", "parsing", "tree-sitter", "lunso"],
+  "scripts": {
+    "test": "tree-sitter test"
+  }
+}

@@ -1,0 +1,94 @@
+==================
+Basic declarations
+==================
+
+import std.io
+const MAX = 0x10
+
+enum Kind : u8 {
+    One = 'a',
+    Two,
+}
+
+struct Pair {
+    a: i32
+    b: []u8
+}
+
+pub fun add(x: i32, y: i32): i32 {
+    var p = Pair { a: x, b: "ok" }
+    match Kind.One {
+        Kind.One => return p.a + y
+        Kind.Two => return 0
+    }
+}
+
+---
+
+(source_file
+  (import_declaration
+    (module_path
+      (identifier)
+      (identifier)))
+  (const_declaration
+    (identifier)
+    (integer_literal))
+  (enum_declaration
+    (identifier)
+    (primitive_type)
+    (enum_member
+      (identifier)
+      (char_literal))
+    (enum_member
+      (identifier)))
+  (struct_declaration
+    (identifier)
+    (field_declaration
+      (identifier)
+      (primitive_type))
+    (field_declaration
+      (identifier)
+      (slice_type
+        (primitive_type))))
+  (function_declaration
+    (visibility)
+    (identifier)
+    (parameter_list
+      (parameter
+        (identifier)
+        (primitive_type))
+      (parameter
+        (identifier)
+        (primitive_type)))
+    (primitive_type)
+    (block
+      (var_statement
+        (identifier)
+        (struct_literal
+          (identifier)
+          (struct_field_init
+            (identifier)
+            (identifier))
+          (struct_field_init
+            (identifier)
+            (string_literal))))
+      (match_statement
+        (member_expression
+          (identifier)
+          (identifier))
+        (match_arm
+          (member_expression
+            (identifier)
+            (identifier))
+          (return_statement
+            (binary_expression
+              (member_expression
+                (identifier)
+                (identifier))
+              (identifier))))
+        (match_arm
+          (member_expression
+            (identifier)
+            (identifier))
+          (return_statement
+            (integer_literal)))))))

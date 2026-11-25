@@ -1,0 +1,16 @@
+id = "lunso"
+name = "Lunso"
+version = "0.1.0"
+schema_version = 1
+authors = ["Funcieq"]
+description = "Lunso language support (syntax highlighting and LSP)"
+repository = "https://github.com/Funcieq/lunso-lsp"
+
+[grammars.lunso]
+repository = "https://github.com/Funcieq/lunso-lsp"
+rev = "main"
+path = "tree-sitter-lunso"
+
+[language_servers.lunso-lsp]
+name = "Lunso Language Server"
+languages = ["Lunso"]
