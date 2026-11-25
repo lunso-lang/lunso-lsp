@@ -7,8 +7,8 @@ description = "Lunso language support (syntax highlighting and LSP)"
 repository = "https://github.com/Funcieq/lunso-lsp"
 
 [grammars.lunso]
-repository = "https://github.com/Funcieq/lunso-lsp"
-rev = "main"
+repository = "file:///home/funcieq/projects/lunso-lsp"
+rev = "e62600e718ac1bfba62fac27f6f948b3b4b6864c"
 path = "tree-sitter-lunso"
 
 [language_servers.lunso-lsp]
