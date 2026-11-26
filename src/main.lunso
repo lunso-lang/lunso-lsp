@@ -1,0 +1,314 @@
+import std.args
+import std.json
+import std.map
+import std.mem
+import std.os
+import std.path
+import std.str
+import std.vec
+import analysis
+import transport
+
+fun make_range(arena: *mem.Arena, line: u64, col: u64, out: *json.JsonValue): bool {
+    var start: json.JsonValue
+    var end_pos: json.JsonValue
+    if json.object_val(arena, &start) < 0 || json.object_val(arena, &end_pos) < 0 || json.object_val(arena, out) < 0 {
+        return false
+    }
+    if json.set(arena, &start, "line", json.int_val(line as i64)) < 0 ||
+       json.set(arena, &start, "character", json.int_val(col as i64)) < 0 ||
+       json.set(arena, &end_pos, "line", json.int_val(line as i64)) < 0 ||
+       json.set(arena, &end_pos, "character", json.int_val((col + 1) as i64)) < 0 ||
+       json.set(arena, out, "start", start) < 0 ||
+       json.set(arena, out, "end", end_pos) < 0 {
+        return false
+    }
+    return true
+}
+
+fun publish_diagnostics(arena: *mem.Arena, ws: *analysis.Workspace, uri: []u8) {
+    var doc: *analysis.Document
+    if !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+        return
+    }
+    var diag: analysis.Diagnostic
+    var has_diag = false
+    analysis.analyze(arena, ws, doc, &diag, &has_diag)
+
+    var arr: json.JsonValue
+    var params: json.JsonValue
+    if json.array_val(arena, &arr) < 0 || json.object_val(arena, &params) < 0 {
+        return
+    }
+    if has_diag {
+        var range: json.JsonValue
+        var d: json.JsonValue
+        if make_range(arena, diag.line, diag.col, &range) && json.object_val(arena, &d) >= 0 {
+            json.set(arena, &d, "range", range)
+            json.set(arena, &d, "severity", json.int_val(1))
+            json.set(arena, &d, "source", json.str_val("lunso"))
+            json.set(arena, &d, "message", json.str_val(diag.message))
+            json.push(&arr, d)
+        }
+    }
+    json.set(arena, &params, "uri", json.str_val(uri))
+    json.set(arena, &params, "diagnostics", arr)
+    transport.send_notification(arena, "textDocument/publishDiagnostics", params)
+}
+
+fun extract_position(params: json.JsonValue, out_uri: *[]u8, out_line: *u64, out_col: *u64): bool {
+    var td: json.JsonValue
+    var pos: json.JsonValue
+    var line_i: i64 = 0
+    var col_i: i64 = 0
+    if !json.get(params, "textDocument", &td) ||
+       !json.get_str(td, "uri", out_uri) ||
+       !json.get(params, "position", &pos) ||
+       !json.get_i64(pos, "line", &line_i) ||
+       !json.get_i64(pos, "character", &col_i) {
+        return false
+    }
+    if line_i < 0 { line_i = 0 }
+    if col_i < 0 { col_i = 0 }
+    *out_line = line_i as u64
+    *out_col = col_i as u64
+    return true
+}
+
+fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
+    var root_uri: []u8
+    if json.get_str(params, "rootUri", &root_uri) {
+        var rp: []u8
+        if path.from_file_uri(&ws.arena, root_uri, &rp) {
+            ws.root_path = rp
+        }
+    } else {
+        var rp: []u8
+        if json.get_str(params, "rootPath", &rp) {
+            ws.root_path = str.clone(&ws.arena, rp)
+        }
+    }
+
+    var sync: json.JsonValue
+    var comp: json.JsonValue
+    var trig: json.JsonValue
+    var caps: json.JsonValue
+    var info: json.JsonValue
+    var res: json.JsonValue
+    json.object_val(arena, &sync)
+    json.set(arena, &sync, "openClose", json.bool_val(true))
+    json.set(arena, &sync, "change", json.int_val(1))
+
+    json.array_val(arena, &trig)
+    json.push(&trig, json.str_val("."))
+    json.object_val(arena, &comp)
+    json.set(arena, &comp, "triggerCharacters", trig)
+
+    json.object_val(arena, &caps)
+    json.set(arena, &caps, "textDocumentSync", sync)
+    json.set(arena, &caps, "hoverProvider", json.bool_val(true))
+    json.set(arena, &caps, "definitionProvider", json.bool_val(true))
+    json.set(arena, &caps, "completionProvider", comp)
+
+    json.object_val(arena, &info)
+    json.set(arena, &info, "name", json.str_val("lunso-lsp"))
+    json.set(arena, &info, "version", json.str_val("0.3.1"))
+
+    json.object_val(arena, &res)
+    json.set(arena, &res, "capabilities", caps)
+    json.set(arena, &res, "serverInfo", info)
+    transport.send_response(arena, id, res)
+}
+
+fun handle_hover(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
+    var uri: []u8
+    var line: u64 = 0
+    var col: u64 = 0
+    var doc: *analysis.Document
+    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+        transport.send_response(arena, id, json.null_val())
+        return
+    }
+    var md: []u8
+    if !analysis.hover(arena, ws, doc, line, col, &md) {
+        transport.send_response(arena, id, json.null_val())
+        return
+    }
+    var contents: json.JsonValue
+    var res: json.JsonValue
+    json.object_val(arena, &contents)
+    json.set(arena, &contents, "kind", json.str_val("markdown"))
+    json.set(arena, &contents, "value", json.str_val(md))
+    json.object_val(arena, &res)
+    json.set(arena, &res, "contents", contents)
+    transport.send_response(arena, id, res)
+}
+
+fun handle_definition(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
+    var uri: []u8
+    var line: u64 = 0
+    var col: u64 = 0
+    var doc: *analysis.Document
+    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+        transport.send_response(arena, id, json.null_val())
+        return
+    }
+    var target_uri: []u8
+    var target_line: u64 = 0
+    var target_col: u64 = 0
+    if !analysis.definition(arena, ws, doc, line, col, &target_uri, &target_line, &target_col) {
+        transport.send_response(arena, id, json.null_val())
+        return
+    }
+    var range: json.JsonValue
+    var loc: json.JsonValue
+    make_range(arena, target_line, target_col, &range)
+    json.object_val(arena, &loc)
+    json.set(arena, &loc, "uri", json.str_val(target_uri))
+    json.set(arena, &loc, "range", range)
+    transport.send_response(arena, id, loc)
+}
+
+fun handle_completion(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
+    var uri: []u8
+    var line: u64 = 0
+    var col: u64 = 0
+    var doc: *analysis.Document
+    var arr: json.JsonValue
+    json.array_val(arena, &arr)
+    if extract_position(params, &uri, &line, &col) && map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+        var items: vec.Vec[analysis.CompletionItem]
+        if analysis.completion(arena, ws, doc, line, col, &items) {
+            for var i: u64 = 0; i < items.len; i += 1 {
+                var it = items.data[i]
+                var obj: json.JsonValue
+                if json.object_val(arena, &obj) >= 0 {
+                    json.set(arena, &obj, "label", json.str_val(it.label))
+                    json.set(arena, &obj, "kind", json.int_val(it.kind))
+                    json.push(&arr, obj)
+                }
+            }
+        }
+    }
+    transport.send_response(arena, id, arr)
+}
+
+fun main(): i32 {
+    var ws: analysis.Workspace
+    if !analysis.workspace_init(&ws, "") {
+        return 1
+    }
+    defer analysis.workspace_deinit(&ws)
+
+    var cli_args: [][]u8
+    if args.load(&ws.arena, &cli_args) > 0 {
+        for var i: i64 = 1; i + 1 < len(cli_args); i += 1 {
+            if str.equals(cli_args[i], "--std") {
+                ws.std_dir = cli_args[i + 1]
+                i += 1
+            }
+        }
+    }
+
+    var shutdown_requested = false
+    for {
+        var req_arena: mem.Arena
+        if mem.init(&req_arena, 65536) < 0 {
+            return 1
+        }
+
+        var body: []u8
+        var rr = transport.read_message(&req_arena, &body)
+        if rr == 0 {
+            mem.deinit(&req_arena)
+            break
+        }
+        if rr < 0 {
+            mem.deinit(&req_arena)
+            return 1
+        }
+
+        var msg: json.JsonValue
+        if !json.parse(&req_arena, body, &msg) || msg.kind != json.JsonKind.Object {
+            mem.deinit(&req_arena)
+            continue
+        }
+
+        var method: []u8
+        var has_method = json.get_str(msg, "method", &method)
+        var id: json.JsonValue
+        var has_id = json.get(msg, "id", &id)
+        var params: json.JsonValue
+        if !json.get(msg, "params", &params) {
+            params = json.null_val()
+        }
+
+        if has_method {
+            if str.equals(method, "initialize") && has_id {
+                handle_initialize(&req_arena, &ws, id, params)
+            } else if str.equals(method, "shutdown") && has_id {
+                shutdown_requested = true
+                transport.send_response(&req_arena, id, json.null_val())
+            } else if str.equals(method, "exit") {
+                mem.deinit(&req_arena)
+                if shutdown_requested { return 0 }
+                return 1
+            } else if str.equals(method, "textDocument/didOpen") {
+                var td: json.JsonValue
+                var uri: []u8
+                var text: []u8
+                var ver: i64 = 0
+                if json.get(params, "textDocument", &td) &&
+                   json.get_str(td, "uri", &uri) &&
+                   json.get_str(td, "text", &text) {
+                    json.get_i64(td, "version", &ver)
+                    analysis.doc_open(&ws, uri, text, ver)
+                    publish_diagnostics(&req_arena, &ws, uri)
+                }
+            } else if str.equals(method, "textDocument/didChange") {
+                var td: json.JsonValue
+                var uri: []u8
+                var changes: json.JsonValue
+                var ver: i64 = 0
+                if json.get(params, "textDocument", &td) &&
+                   json.get_str(td, "uri", &uri) &&
+                   json.get(params, "contentChanges", &changes) {
+                    json.get_i64(td, "version", &ver)
+                    var last_idx = json.len_of(changes)
+                    var ch: json.JsonValue
+                    var new_text: []u8
+                    if last_idx > 0 && json.at(changes, last_idx - 1, &ch) && json.get_str(ch, "text", &new_text) {
+                        analysis.doc_open(&ws, uri, new_text, ver)
+                        publish_diagnostics(&req_arena, &ws, uri)
+                    }
+                }
+            } else if str.equals(method, "textDocument/didClose") {
+                var td: json.JsonValue
+                var uri: []u8
+                if json.get(params, "textDocument", &td) && json.get_str(td, "uri", &uri) {
+                    analysis.doc_close(&ws, uri)
+                    var arr: json.JsonValue
+                    var empty_p: json.JsonValue
+                    json.array_val(&req_arena, &arr)
+                    json.object_val(&req_arena, &empty_p)
+                    json.set(&req_arena, &empty_p, "uri", json.str_val(uri))
+                    json.set(&req_arena, &empty_p, "diagnostics", arr)
+                    transport.send_notification(&req_arena, "textDocument/publishDiagnostics", empty_p)
+                }
+            } else if str.equals(method, "textDocument/hover") && has_id {
+                handle_hover(&req_arena, &ws, id, params)
+            } else if str.equals(method, "textDocument/definition") && has_id {
+                handle_definition(&req_arena, &ws, id, params)
+            } else if str.equals(method, "textDocument/completion") && has_id {
+                handle_completion(&req_arena, &ws, id, params)
+            } else if has_id {
+                transport.send_error(&req_arena, id, -32601, "method not found")
+            }
+        }
+
+        mem.deinit(&req_arena)
+    }
+
+    if shutdown_requested { return 0 }
+    return 0
+}

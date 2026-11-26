@@ -1,0 +1,120 @@
+import std.fmt
+import std.io
+import std.json
+import std.mem
+import std.str
+import std.vec
+
+pub fun read_message(arena: *mem.Arena, out: *[]u8): i32 {
+    var header_buf: [1024]u8
+    var has_len = false
+    var content_len: u64 = 0
+
+    for {
+        var line: []u8
+        var r = io.read_line(&header_buf[0], 1024, &line)
+        if r < 0 {
+            return -1
+        }
+        if r == 0 {
+            if !has_len {
+                return 0
+            }
+            return -1
+        }
+        if len(line) == 0 {
+            break
+        }
+        if str.starts_with(line, "Content-Length:") || str.starts_with(line, "content-length:") {
+            var val_slice = line[15..len(line)]
+            if !fmt.parse_u64(val_slice, &content_len) {
+                return -1
+            }
+            has_len = true
+        }
+    }
+
+    if !has_len {
+        return -1
+    }
+    if content_len == 0 {
+        *out = ""
+        return 1
+    }
+
+    var body_ptr: *u8
+    if mem.alloc(arena, content_len, 1, &body_ptr) < 0 {
+        return -1
+    }
+    var got = io.read_exact(body_ptr, content_len)
+    if got < 0 || (got as u64) != content_len {
+        return -1
+    }
+    *out = body_ptr[0..(content_len as i64)]
+    return 1
+}
+
+fun write_all_stdout(data_bytes: []u8): bool {
+    var written: i64 = 0
+    var total = len(data_bytes)
+    for written < total {
+        var n = io.write_bytes(1, data_bytes[written..total])
+        if n == -4 {
+            continue
+        }
+        if n <= 0 {
+            return false
+        }
+        written += n
+    }
+    return true
+}
+
+pub fun write_message(arena: *mem.Arena, body: []u8): bool {
+    var len_buf: [32]u8
+    var n = fmt.u64_to_buf(len(body) as u64, &len_buf[0], 32)
+    if n <= 0 {
+        return false
+    }
+    var hdr = str.concat3(arena, "Content-Length: ", len_buf[0..n], "\r\n\r\n")
+    if len(hdr) == 0 {
+        return false
+    }
+    return write_all_stdout(hdr) && write_all_stdout(body)
+}
+
+pub fun send_response(arena: *mem.Arena, id: json.JsonValue, result: json.JsonValue): bool {
+    var msg: json.JsonValue
+    if json.object_val(arena, &msg) < 0 { return false }
+    if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
+    if json.set(arena, &msg, "id", id) < 0 { return false }
+    if json.set(arena, &msg, "result", result) < 0 { return false }
+    var body: []u8
+    if json.stringify(arena, msg, &body) < 0 { return false }
+    return write_message(arena, body)
+}
+
+pub fun send_error(arena: *mem.Arena, id: json.JsonValue, code: i64, message: []u8): bool {
+    var msg: json.JsonValue
+    var err_obj: json.JsonValue
+    if json.object_val(arena, &msg) < 0 || json.object_val(arena, &err_obj) < 0 { return false }
+    if json.set(arena, &err_obj, "code", json.int_val(code)) < 0 { return false }
+    if json.set(arena, &err_obj, "message", json.str_val(message)) < 0 { return false }
+    if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
+    if json.set(arena, &msg, "id", id) < 0 { return false }
+    if json.set(arena, &msg, "error", err_obj) < 0 { return false }
+    var body: []u8
+    if json.stringify(arena, msg, &body) < 0 { return false }
+    return write_message(arena, body)
+}
+
+pub fun send_notification(arena: *mem.Arena, method: []u8, params: json.JsonValue): bool {
+    var msg: json.JsonValue
+    if json.object_val(arena, &msg) < 0 { return false }
+    if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
+    if json.set(arena, &msg, "method", json.str_val(method)) < 0 { return false }
+    if json.set(arena, &msg, "params", params) < 0 { return false }
+    var body: []u8
+    if json.stringify(arena, msg, &body) < 0 { return false }
+    return write_message(arena, body)
+}

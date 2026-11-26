@@ -1,18 +1,18 @@
-CC ?= cc
-CFLAGS ?= -std=c11 -Wall -Wextra -Wpedantic -O2
-PYTHON ?= python3
+LUNSO ?= ../lunsoc/build/lunsoc
+LUNSOC_SRC ?= ../lunsoc/src
+LUNSO_STD ?= ../lunsoc/std
+LUNSO_STD_OBJ ?= ../lunsoc/build/std-linux-x86_64.o
 
-.PHONY: all clean test
+.PHONY: all test clean
 
 all: build/lunso-lsp
 
-build/lunso-lsp: src/main.c
+build/lunso-lsp: src/main.lunso src/transport.lunso src/analysis.lunso
 	mkdir -p build
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $< $(LDLIBS)
+	LUNSO_STD_OBJ=$(CURDIR)/$(LUNSO_STD_OBJ) $(LUNSO) --build -I $(CURDIR)/src -I $(LUNSOC_SRC) --std $(LUNSO_STD) src/main.lunso -o build/lunso-lsp
 
-test: build/lunso-lsp
-	cd tree-sitter-lunso && tree-sitter test
-	$(PYTHON) tests/test_lsp.py
+test: all
+	python3 tests/run.py
 
 clean:
-	rm -f build/lunso-lsp
+	rm -rf build

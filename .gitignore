@@ -1,5 +1,2 @@
-/build/
-/zed/target/
-/zed/extension.wasm
-/zed/grammars/
-/tree-sitter-lunso/node_modules/
+build/
+*.o
