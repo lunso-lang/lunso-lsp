@@ -64,8 +64,12 @@ class TestLunsoLsp(unittest.TestCase):
                 "import \n"
                 "import std.\n"
                 "import support.\n"
+                "struct Inner {\n"
+                "    val: i32\n"
+                "}\n"
                 "struct Pair {\n"
                 "    a: i32\n"
+                "    nested: Inner\n"
                 "}\n"
                 "fun helper(x: i32): i32 {\n"
                 "    return math.add_two(x)\n"
@@ -73,6 +77,10 @@ class TestLunsoLsp(unittest.TestCase):
                 "fun main(): i32 {\n"
                 "    io.\n"
                 "    var local_val: i32 = 42\n"
+                "    var items: []Pair\n"
+                "    items[0].\n"
+                "    items[0].nested.\n"
+                "    unknown_var.\n"
                 "    for var idx: i32 = 0; idx < 3; idx += 1 {\n"
                 "        var inner = idx + local_val\n"
                 "    }\n"
@@ -151,18 +159,46 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 5,
                 "method": "textDocument/completion",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 12, "character": 7}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 16, "character": 7}},
             })
             comp_io = {item["label"] for item in read_msg(proc.stdout)["result"]}
             self.assertIn("println", comp_io)
             self.assertIn("eprintln", comp_io)
+
+            # 4b. `items[0].` and `items[0].nested.` struct field completion (no keywords!)
+            send({
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 19, "character": 13}},
+            })
+            comp_item = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp_item, {"a", "nested"})
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 52,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 20}},
+            })
+            comp_nested = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp_nested, {"val"})
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 53,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 21, "character": 16}},
+            })
+            comp_unknown = read_msg(proc.stdout)["result"]
+            self.assertEqual(comp_unknown, [])
 
             # 5. Hover on imported `math.add_two`
             send({
                 "jsonrpc": "2.0",
                 "id": 6,
                 "method": "textDocument/hover",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 18}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 18}},
             })
             hover_imp = read_msg(proc.stdout)["result"]
             self.assertIn("pub fun add_two(v: i32): i32", hover_imp["contents"]["value"])
@@ -172,7 +208,7 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 7,
                 "method": "textDocument/definition",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 18}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 18}},
             })
             def_imp = read_msg(proc.stdout)["result"]
             self.assertEqual(def_imp["uri"], (workdir / "support" / "math.lunso").as_uri())
@@ -183,7 +219,7 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 70,
                 "method": "textDocument/hover",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 24}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 24}},
             })
             hover_param = read_msg(proc.stdout)["result"]
             self.assertIn("x: i32", hover_param["contents"]["value"])
@@ -192,11 +228,11 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 71,
                 "method": "textDocument/definition",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 24}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 24}},
             })
             def_param = read_msg(proc.stdout)["result"]
             self.assertEqual(def_param["uri"], uri)
-            self.assertEqual(def_param["range"]["start"]["line"], 8)
+            self.assertEqual(def_param["range"]["start"]["line"], 12)
             self.assertEqual(def_param["range"]["start"]["character"], 11)
 
             # 6c. Hover & Go to definition on local `local_val` and loop var `idx`
@@ -204,7 +240,7 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 72,
                 "method": "textDocument/hover",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 20}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 25, "character": 20}},
             })
             hover_local = read_msg(proc.stdout)["result"]
             self.assertIn("var local_val: i32 = 42", hover_local["contents"]["value"])
@@ -213,18 +249,18 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 73,
                 "method": "textDocument/definition",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 20}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 25, "character": 20}},
             })
             def_local = read_msg(proc.stdout)["result"]
             self.assertEqual(def_local["uri"], uri)
-            self.assertEqual(def_local["range"]["start"]["line"], 13)
+            self.assertEqual(def_local["range"]["start"]["line"], 17)
             self.assertEqual(def_local["range"]["start"]["character"], 8)
 
             send({
                 "jsonrpc": "2.0",
                 "id": 74,
                 "method": "textDocument/hover",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 15, "character": 21}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 23, "character": 21}},
             })
             hover_loop = read_msg(proc.stdout)["result"]
             self.assertIn("var idx: i32 = 0", hover_loop["contents"]["value"])
@@ -234,7 +270,7 @@ class TestLunsoLsp(unittest.TestCase):
                 "jsonrpc": "2.0",
                 "id": 75,
                 "method": "textDocument/completion",
-                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 11}},
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 25, "character": 11}},
             })
             comp_main = {item["label"] for item in read_msg(proc.stdout)["result"]}
             self.assertIn("local_val", comp_main)

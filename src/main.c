@@ -1627,6 +1627,527 @@ static void append_module_dir_completions(StrBuf *sb, bool *first, const char *d
     free(dir_path);
 }
 
+static char *trim_dup(const char *s, size_t len)
+{
+    while (len > 0 && (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n')) {
+        s++;
+        len--;
+    }
+    while (len > 0 && (s[len - 1] == ' ' || s[len - 1] == '\t' || s[len - 1] == '\r' || s[len - 1] == '\n')) {
+        len--;
+    }
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    memcpy(out, s, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char *strip_pointer_prefix(const char *type_str)
+{
+    if (!type_str) return NULL;
+    const char *p = type_str;
+    while (*p == ' ' || *p == '\t') p++;
+    while (*p == '*') {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "const", 5) == 0 && (p[5] == ' ' || p[5] == '\t' || p[5] == '*')) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+    }
+    return trim_dup(p, strlen(p));
+}
+
+static char *strip_one_index_type(const char *type_str)
+{
+    if (!type_str) return NULL;
+    const char *p = type_str;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p != '[') return NULL;
+    p++;
+    int depth = 1;
+    while (*p && depth > 0) {
+        if (*p == '[') depth++;
+        else if (*p == ']') depth--;
+        p++;
+    }
+    if (depth != 0) return NULL;
+    while (*p == ' ' || *p == '\t') p++;
+    if (strncmp(p, "const", 5) == 0 && (p[5] == ' ' || p[5] == '\t')) {
+        p += 5;
+        while (*p == ' ' || *p == '\t') p++;
+    }
+    return trim_dup(p, strlen(p));
+}
+
+static const char *find_type_decl_body_in_text(const char *text, const char *type_name, bool *out_is_enum)
+{
+    if (!text || !type_name || !*type_name) return NULL;
+    size_t tlen = strlen(type_name);
+    const char *p = text;
+    while (*p) {
+        const char *line_start = p;
+        const char *eol = strchr(p, '\n');
+        const char *cur = line_start;
+        if (*cur != ' ' && *cur != '\t') {
+            if (strncmp(cur, "pub ", 4) == 0) {
+                cur += 4;
+                while (*cur == ' ' || *cur == '\t') cur++;
+            } else if (strncmp(cur, "priv ", 5) == 0) {
+                cur += 5;
+                while (*cur == ' ' || *cur == '\t') cur++;
+            }
+            bool is_struct = strncmp(cur, "struct ", 7) == 0;
+            bool is_enum = !is_struct && strncmp(cur, "enum ", 5) == 0;
+            if (is_struct || is_enum) {
+                cur += is_struct ? 7 : 5;
+                while (*cur == ' ' || *cur == '\t') cur++;
+                if (strncmp(cur, type_name, tlen) == 0 && !is_ident_char((unsigned char)cur[tlen])) {
+                    const char *brace = strchr(cur + tlen, '{');
+                    if (brace) {
+                        *out_is_enum = is_enum;
+                        return brace + 1;
+                    }
+                }
+            }
+        }
+        if (!eol) break;
+        p = eol + 1;
+    }
+    return NULL;
+}
+
+static const char *find_type_body(const Document *doc, const char *raw_type,
+                                  char **out_owned_text, bool *out_is_enum)
+{
+    *out_owned_text = NULL;
+    *out_is_enum = false;
+    char *type_name = strip_pointer_prefix(raw_type);
+    if (!type_name || !*type_name) {
+        free(type_name);
+        return NULL;
+    }
+
+    const char *dot = strrchr(type_name, '.');
+    if (dot) {
+        size_t qlen = (size_t)(dot - type_name);
+        char *qual = malloc(qlen + 1);
+        memcpy(qual, type_name, qlen);
+        qual[qlen] = '\0';
+        const char *tname = dot + 1;
+        const char *mod_path = resolve_imported_module(doc, qual);
+        free(qual);
+        if (mod_path) {
+            char *f_path = resolve_module_file(doc->path, mod_path);
+            if (f_path) {
+                char *text = read_file_text(f_path);
+                free(f_path);
+                if (text) {
+                    const char *body = find_type_decl_body_in_text(text, tname, out_is_enum);
+                    if (body) {
+                        *out_owned_text = text;
+                        free(type_name);
+                        return body;
+                    }
+                    free(text);
+                }
+            }
+        }
+        free(type_name);
+        return NULL;
+    }
+
+    const char *body = find_type_decl_body_in_text(doc->text, type_name, out_is_enum);
+    if (body) {
+        free(type_name);
+        return body;
+    }
+
+    for (size_t i = 0; i < doc->import_count; i++) {
+        const Import *imp = &doc->imports[i];
+        const char *lookup = NULL;
+        if (imp->wildcard) {
+            lookup = type_name;
+        } else if (imp->selective) {
+            for (size_t j = 0; j < imp->item_count; j++) {
+                if (strcmp(imp->item_aliases[j], type_name) == 0) {
+                    lookup = imp->items[j];
+                    break;
+                }
+            }
+        }
+        if (!lookup) continue;
+        char *f_path = resolve_module_file(doc->path, imp->module_path);
+        if (!f_path) continue;
+        char *text = read_file_text(f_path);
+        free(f_path);
+        if (!text) continue;
+        body = find_type_decl_body_in_text(text, lookup, out_is_enum);
+        if (body) {
+            *out_owned_text = text;
+            free(type_name);
+            return body;
+        }
+        free(text);
+    }
+
+    free(type_name);
+    return NULL;
+}
+
+static void scan_type_members(const char *body, bool is_enum,
+                              StrBuf *sb, bool *first,
+                              const char *lookup_field, char **out_field_type)
+{
+    if (out_field_type) *out_field_type = NULL;
+    const char *p = body;
+    int depth = 1;
+    while (*p && depth > 0) {
+        while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n' || *p == ';' || *p == ',') {
+            p++;
+        }
+        if (*p == '/' && p[1] == '/') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        if (*p == '/' && p[1] == '*') {
+            p += 2;
+            while (*p && !(p[0] == '*' && p[1] == '/')) p++;
+            if (*p) p += 2;
+            continue;
+        }
+        if (*p == '}') {
+            depth--;
+            break;
+        }
+        if (*p == '{') {
+            depth++;
+            p++;
+            continue;
+        }
+        if (depth == 1 && is_ident_start((unsigned char)*p)) {
+            const char *name_start = p;
+            while (is_ident_char((unsigned char)*p)) p++;
+            size_t name_len = (size_t)(p - name_start);
+            const char *after_name = p;
+            while (*p == ' ' || *p == '\t') p++;
+            if (!is_enum && *p == ':') {
+                p++;
+                while (*p == ' ' || *p == '\t') p++;
+                const char *type_start = p;
+                while (*p && *p != '\n' && *p != '\r' && *p != ';' && *p != '}') {
+                    if (*p == '/' && p[1] == '/') break;
+                    p++;
+                }
+                char *ftype = trim_dup(type_start, (size_t)(p - type_start));
+                if (lookup_field) {
+                    if (strlen(lookup_field) == name_len && strncmp(lookup_field, name_start, name_len) == 0) {
+                        *out_field_type = ftype;
+                        return;
+                    }
+                    free(ftype);
+                } else if (sb && first) {
+                    char *fname = trim_dup(name_start, name_len);
+                    char *detail = trim_dup(name_start, (size_t)(p - name_start));
+                    append_completion_item(sb, first, fname, 5, detail);
+                    free(fname);
+                    free(detail);
+                    free(ftype);
+                } else {
+                    free(ftype);
+                }
+                continue;
+            } else if (is_enum) {
+                const char *tend = after_name;
+                while (*p && *p != '\n' && *p != '\r' && *p != ',' && *p != ';' && *p != '}') {
+                    if (*p == '/' && p[1] == '/') break;
+                    p++;
+                }
+                tend = p;
+                if (sb && first && !lookup_field) {
+                    char *mname = trim_dup(name_start, name_len);
+                    char *detail = trim_dup(name_start, (size_t)(tend - name_start));
+                    append_completion_item(sb, first, mname, 20, detail);
+                    free(mname);
+                    free(detail);
+                }
+                continue;
+            }
+        }
+        if (*p) p++;
+    }
+}
+
+static char *lookup_struct_field_type(const Document *doc, const char *type_name, const char *field_name)
+{
+    char *owned = NULL;
+    bool is_enum = false;
+    const char *body = find_type_body(doc, type_name, &owned, &is_enum);
+    if (!body || is_enum) {
+        free(owned);
+        return NULL;
+    }
+    char *ftype = NULL;
+    scan_type_members(body, false, NULL, NULL, field_name, &ftype);
+    free(owned);
+    return ftype;
+}
+
+static bool append_type_member_completions(StrBuf *sb, bool *first, const Document *doc, const char *type_name)
+{
+    char *owned = NULL;
+    bool is_enum = false;
+    const char *body = find_type_body(doc, type_name, &owned, &is_enum);
+    if (!body) {
+        free(owned);
+        return false;
+    }
+    scan_type_members(body, is_enum, sb, first, NULL, NULL);
+    free(owned);
+    return true;
+}
+
+static char *resolve_expr_type(const Document *doc, long long line, long long col, const char *expr);
+
+static char *type_from_symbol_detail(const Document *doc, long long line, long long col,
+                                     const Symbol *sym, bool is_call)
+{
+    if (!sym || !sym->detail) return NULL;
+    const char *d = sym->detail;
+    if (sym->kind == 12) { // Function
+        if (!is_call) return NULL;
+        const char *lp = strchr(d, '(');
+        if (!lp) return NULL;
+        int pd = 1;
+        const char *p = lp + 1;
+        while (*p && pd > 0) {
+            if (*p == '(') pd++;
+            else if (*p == ')') pd--;
+            p++;
+        }
+        if (pd != 0) return NULL;
+        while (*p == ' ' || *p == '\t') p++;
+        if (*p != ':') return NULL;
+        p++;
+        const char *end = p;
+        while (*end && *end != '{' && *end != '\n' && *end != '\r') end++;
+        return trim_dup(p, (size_t)(end - p));
+    }
+    if (sym->kind == 23 || sym->kind == 10) { // Struct / Enum
+        return strdup(sym->name);
+    }
+
+    // Variable (13) or Constant (14): `var x: T = ...` or `x: T` or `var x = Init`
+    const char *after_name = strstr(d, sym->name);
+    if (after_name) {
+        after_name += strlen(sym->name);
+    } else {
+        after_name = d;
+    }
+    while (*after_name == ' ' || *after_name == '\t') after_name++;
+    if (*after_name == ':') {
+        after_name++;
+        const char *end = after_name;
+        while (*end && *end != '=' && *end != ';' && *end != '\n' && *end != '\r') end++;
+        return trim_dup(after_name, (size_t)(end - after_name));
+    }
+    if (*after_name == '=') {
+        after_name++;
+        while (*after_name == ' ' || *after_name == '\t') after_name++;
+        if (*after_name == '[') {
+            const char *elem = after_name + 1;
+            while (*elem == ' ' || *elem == '\t') elem++;
+            if (is_ident_start((unsigned char)*elem)) {
+                const char *es = elem;
+                while (is_ident_char((unsigned char)*elem) || *elem == '.') elem++;
+                const char *sp = elem;
+                while (*sp == ' ' || *sp == '\t') sp++;
+                if (*sp == '{') {
+                    StrBuf tb;
+                    sb_init(&tb);
+                    sb_append(&tb, "[]");
+                    char *et = trim_dup(es, (size_t)(elem - es));
+                    sb_append(&tb, et);
+                    free(et);
+                    return tb.data;
+                }
+            }
+        } else if (is_ident_start((unsigned char)*after_name)) {
+            const char *is = after_name;
+            while (is_ident_char((unsigned char)*after_name) || *after_name == '.') after_name++;
+            const char *sp = after_name;
+            while (*sp == ' ' || *sp == '\t') sp++;
+            if (*sp == '{') {
+                return trim_dup(is, (size_t)(after_name - is));
+            }
+            if (*sp == '(') {
+                char *call_expr = malloc((size_t)(after_name - is) + 3);
+                memcpy(call_expr, is, (size_t)(after_name - is));
+                call_expr[after_name - is] = '(';
+                call_expr[after_name - is + 1] = ')';
+                call_expr[after_name - is + 2] = '\0';
+                char *ret = resolve_expr_type(doc, line, col, call_expr);
+                free(call_expr);
+                return ret;
+            }
+        }
+    }
+    return NULL;
+}
+
+static char *resolve_base_ident_type(const Document *doc, long long line, long long col,
+                                     const char *name, bool is_call, char **out_mod_alias)
+{
+    if (out_mod_alias) *out_mod_alias = NULL;
+    if (!is_call) {
+        const char *mod_path = resolve_imported_module(doc, name);
+        if (mod_path) {
+            if (out_mod_alias) *out_mod_alias = strdup(name);
+            return NULL;
+        }
+    }
+    Symbol sym = {0};
+    char *target_uri = NULL;
+    if (resolve_symbol_target(doc, name, NULL, line, col, &target_uri, &sym)) {
+        char *t = type_from_symbol_detail(doc, line, col, &sym, is_call);
+        free(target_uri);
+        free(sym.name);
+        free(sym.detail);
+        return t;
+    }
+    return NULL;
+}
+
+static char *resolve_expr_type(const Document *doc, long long line, long long col, const char *expr)
+{
+    if (!doc || !expr || !*expr) return NULL;
+    const char *p = expr;
+    char *cur_type = NULL;
+    char *cur_mod = NULL;
+    bool first_seg = true;
+
+    while (*p) {
+        if (!is_ident_start((unsigned char)*p)) {
+            free(cur_type);
+            free(cur_mod);
+            return NULL;
+        }
+        const char *id_start = p;
+        while (is_ident_char((unsigned char)*p)) p++;
+        char *ident = trim_dup(id_start, (size_t)(p - id_start));
+        bool is_call = false;
+        if (*p == '(') {
+            is_call = true;
+            int pd = 1;
+            p++;
+            while (*p && pd > 0) {
+                if (*p == '(') pd++;
+                else if (*p == ')') pd--;
+                p++;
+            }
+        }
+
+        if (first_seg) {
+            first_seg = false;
+            cur_type = resolve_base_ident_type(doc, line, col, ident, is_call, &cur_mod);
+        } else if (cur_mod) {
+            Symbol sym = {0};
+            char *target_uri = NULL;
+            if (resolve_symbol_target(doc, ident, cur_mod, line, col, &target_uri, &sym)) {
+                if (!is_call && (sym.kind == 23 || sym.kind == 10)) {
+                    StrBuf qt;
+                    sb_init(&qt);
+                    sb_append(&qt, cur_mod);
+                    sb_append_char(&qt, '.');
+                    sb_append(&qt, sym.name);
+                    cur_type = qt.data;
+                } else {
+                    cur_type = type_from_symbol_detail(doc, line, col, &sym, is_call);
+                }
+                free(target_uri);
+                free(sym.name);
+                free(sym.detail);
+            }
+            free(cur_mod);
+            cur_mod = NULL;
+        } else if (cur_type) {
+            char *next_type = lookup_struct_field_type(doc, cur_type, ident);
+            free(cur_type);
+            cur_type = next_type;
+        }
+        free(ident);
+
+        while (*p == '[') {
+            int bd = 1;
+            p++;
+            while (*p && bd > 0) {
+                if (*p == '[') bd++;
+                else if (*p == ']') bd--;
+                p++;
+            }
+            if (cur_type) {
+                char *elem = strip_one_index_type(cur_type);
+                free(cur_type);
+                cur_type = elem;
+            }
+        }
+
+        if (!cur_type && !cur_mod) {
+            return NULL;
+        }
+        if (*p == '.') {
+            p++;
+            continue;
+        }
+        break;
+    }
+    free(cur_mod);
+    return cur_type;
+}
+
+static char *extract_receiver_expr(const char *lp, size_t qend)
+{
+    if (!lp || qend == 0) return NULL;
+    size_t pos = qend;
+    while (pos > 0) {
+        if (lp[pos - 1] == ']' || lp[pos - 1] == ')') {
+            char close_ch = lp[pos - 1];
+            char open_ch = (close_ch == ']') ? '[' : '(';
+            int depth = 1;
+            pos--;
+            while (pos > 0 && depth > 0) {
+                pos--;
+                if (lp[pos] == close_ch) depth++;
+                else if (lp[pos] == open_ch) depth--;
+            }
+            if (depth != 0) return NULL;
+        }
+        size_t id_end = pos;
+        while (pos > 0 && is_ident_char((unsigned char)lp[pos - 1])) {
+            pos--;
+        }
+        if (pos == id_end) {
+            return NULL;
+        }
+        if (pos > 0 && lp[pos - 1] == '.') {
+            pos--;
+            continue;
+        }
+        break;
+    }
+    if (qend <= pos) return NULL;
+    bool all_digits = true;
+    for (size_t i = pos; i < qend; i++) {
+        if (!isdigit((unsigned char)lp[i])) {
+            all_digits = false;
+            break;
+        }
+    }
+    if (all_digits) return NULL;
+    return trim_dup(lp + pos, qend - pos);
+}
+
 static void handle_completion(const char *id_raw, const char *params)
 {
     static const char *const keywords[] = {
@@ -1726,21 +2247,14 @@ static void handle_completion(const char *id_raw, const char *params)
             return;
         }
 
-        // Case 2: member completion `<module>.`
+        // Case 2: member completion `<module>.` or `<expr>.`
         if (lp && cursor > 0) {
             size_t scan = cursor;
             while (scan > 0 && is_ident_char((unsigned char)lp[scan - 1])) scan--;
             if (scan > 0 && lp[scan - 1] == '.') {
-                size_t qend = scan - 1;
-                size_t qstart = qend;
-                while (qstart > 0 && (is_ident_char((unsigned char)lp[qstart - 1]) || lp[qstart - 1] == '.')) {
-                    qstart--;
-                }
-                if (qend > qstart) {
-                    char *qual = malloc(qend - qstart + 1);
-                    memcpy(qual, lp + qstart, qend - qstart);
-                    qual[qend - qstart] = '\0';
-                    const char *mod_path = resolve_imported_module(doc, qual);
+                char *expr = extract_receiver_expr(lp, scan - 1);
+                if (expr) {
+                    const char *mod_path = resolve_imported_module(doc, expr);
                     if (mod_path) {
                         char *mod_uri = NULL;
                         Symbol *mod_syms = NULL;
@@ -1756,15 +2270,20 @@ static void handle_completion(const char *id_raw, const char *params)
                             free(mod_uri);
                             free_symbol_list(mod_syms, mod_count);
                         }
-                        free(qual);
-                        sb_append_char(&sb, ']');
-                        send_response(id_raw, sb.data);
-                        free(sb.data);
-                        free(uri);
-                        return;
+                    } else {
+                        char *rtype = resolve_expr_type(doc, line, col, expr);
+                        if (rtype) {
+                            append_type_member_completions(&sb, &first, doc, rtype);
+                            free(rtype);
+                        }
                     }
-                    free(qual);
+                    free(expr);
                 }
+                sb_append_char(&sb, ']');
+                send_response(id_raw, sb.data);
+                free(sb.data);
+                free(uri);
+                return;
             }
         }
     }
