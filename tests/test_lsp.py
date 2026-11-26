@@ -72,7 +72,11 @@ class TestLunsoLsp(unittest.TestCase):
                 "}\n"
                 "fun main(): i32 {\n"
                 "    io.\n"
-                "    return helper(10)\n"
+                "    var local_val: i32 = 42\n"
+                "    for var idx: i32 = 0; idx < 3; idx += 1 {\n"
+                "        var inner = idx + local_val\n"
+                "    }\n"
+                "    return helper(local_val)\n"
                 "}\n"
             )
 
@@ -173,6 +177,68 @@ class TestLunsoLsp(unittest.TestCase):
             def_imp = read_msg(proc.stdout)["result"]
             self.assertEqual(def_imp["uri"], (workdir / "support" / "math.lunso").as_uri())
             self.assertEqual(def_imp["range"]["start"]["line"], 1)
+
+            # 6b. Hover & Go to definition on parameter `x`
+            send({
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 24}},
+            })
+            hover_param = read_msg(proc.stdout)["result"]
+            self.assertIn("x: i32", hover_param["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 9, "character": 24}},
+            })
+            def_param = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_param["uri"], uri)
+            self.assertEqual(def_param["range"]["start"]["line"], 8)
+            self.assertEqual(def_param["range"]["start"]["character"], 11)
+
+            # 6c. Hover & Go to definition on local `local_val` and loop var `idx`
+            send({
+                "jsonrpc": "2.0",
+                "id": 72,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 20}},
+            })
+            hover_local = read_msg(proc.stdout)["result"]
+            self.assertIn("var local_val: i32 = 42", hover_local["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 73,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 20}},
+            })
+            def_local = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_local["uri"], uri)
+            self.assertEqual(def_local["range"]["start"]["line"], 13)
+            self.assertEqual(def_local["range"]["start"]["character"], 8)
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 74,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 15, "character": 21}},
+            })
+            hover_loop = read_msg(proc.stdout)["result"]
+            self.assertIn("var idx: i32 = 0", hover_loop["contents"]["value"])
+
+            # Completion inside `main` includes `local_val`
+            send({
+                "jsonrpc": "2.0",
+                "id": 75,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 11}},
+            })
+            comp_main = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("local_val", comp_main)
+            self.assertNotIn("idx", comp_main)
 
             # 7. Diagnostics on valid single-file change
             send({

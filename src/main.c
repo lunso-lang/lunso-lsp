@@ -1049,6 +1049,267 @@ static bool ident_and_qualifier_at(const Document *doc, long long target_line,
     return true;
 }
 
+typedef struct {
+    Symbol sym;
+    int scope_depth;
+} LocalSymbolEntry;
+
+static bool is_kw_at(const char *p, const char *start, const char *kw, size_t kw_len)
+{
+    if (p > start && is_ident_char((unsigned char)p[-1])) {
+        return false;
+    }
+    if (strncmp(p, kw, kw_len) != 0) {
+        return false;
+    }
+    char next = p[kw_len];
+    return next == '\0' || !is_ident_char((unsigned char)next);
+}
+
+static void add_local_entry(LocalSymbolEntry **entries, size_t *count,
+                            const char *name, size_t name_len,
+                            const char *detail, size_t detail_len,
+                            int kind, int line, int col, int scope_depth)
+{
+    LocalSymbolEntry *grown = realloc(*entries, (*count + 1) * sizeof(*grown));
+    if (!grown) {
+        return;
+    }
+    *entries = grown;
+    LocalSymbolEntry *e = &(*entries)[(*count)++];
+    e->sym.name = malloc(name_len + 1);
+    memcpy(e->sym.name, name, name_len);
+    e->sym.name[name_len] = '\0';
+    e->sym.detail = malloc(detail_len + 1);
+    memcpy(e->sym.detail, detail, detail_len);
+    e->sym.detail[detail_len] = '\0';
+    e->sym.kind = kind;
+    e->sym.line = line;
+    e->sym.col = col;
+    e->sym.end_col = col + (int)name_len;
+    e->sym.is_pub = false;
+    e->scope_depth = scope_depth;
+}
+
+static void pop_local_entries(LocalSymbolEntry *entries, size_t *count, int min_depth)
+{
+    while (*count > 0 && entries[*count - 1].scope_depth >= min_depth) {
+        (*count)--;
+        free(entries[*count].sym.name);
+        free(entries[*count].sym.detail);
+    }
+}
+
+static void collect_local_symbols_at(const Document *doc, long long cursor_line, long long cursor_col,
+                                     Symbol **out_syms, size_t *out_count)
+{
+    *out_syms = NULL;
+    *out_count = 0;
+    if (!doc || !doc->text || cursor_line < 0) {
+        return;
+    }
+
+    LocalSymbolEntry *entries = NULL;
+    size_t entry_count = 0;
+    int scope_depth = 0;
+    bool in_for_header = false;
+    bool in_block_comment = false;
+
+    const char *text = doc->text;
+    const char *p = text;
+    const char *line_start = text;
+    long long line = 0;
+
+    while (*p) {
+        long long col = (long long)(p - line_start);
+        if (line > cursor_line || (line == cursor_line && col > cursor_col)) {
+            break;
+        }
+
+        if (in_block_comment) {
+            if (p[0] == '*' && p[1] == '/') {
+                in_block_comment = false;
+                p += 2;
+                continue;
+            }
+            if (*p == '\n') {
+                line++;
+                line_start = p + 1;
+            }
+            p++;
+            continue;
+        }
+
+        if (*p == '/' && p[1] == '/') {
+            while (*p && *p != '\n') p++;
+            continue;
+        }
+        if (*p == '/' && p[1] == '*') {
+            in_block_comment = true;
+            p += 2;
+            continue;
+        }
+        if (*p == '"' || *p == '\'') {
+            char quote = *p++;
+            while (*p && *p != quote) {
+                if (*p == '\\' && p[1]) {
+                    p += 2;
+                    continue;
+                }
+                if (*p == '\n') {
+                    line++;
+                    line_start = p + 1;
+                }
+                p++;
+            }
+            if (*p == quote) p++;
+            continue;
+        }
+
+        if (*p == '\n') {
+            line++;
+            line_start = p + 1;
+            p++;
+            continue;
+        }
+
+        if (*p == '{') {
+            scope_depth++;
+            in_for_header = false;
+            p++;
+            continue;
+        }
+        if (*p == '}') {
+            pop_local_entries(entries, &entry_count, scope_depth);
+            if (scope_depth > 0) {
+                scope_depth--;
+            }
+            in_for_header = false;
+            p++;
+            continue;
+        }
+
+        if (is_kw_at(p, text, "for", 3)) {
+            in_for_header = true;
+            p += 3;
+            continue;
+        }
+
+        if (scope_depth == 0 && is_kw_at(p, text, "fun", 3)) {
+            bool is_ext = false;
+            const char *back = p;
+            while (back > line_start && (back[-1] == ' ' || back[-1] == '\t')) back--;
+            if (back - line_start >= 3 && strncmp(back - 3, "ext", 3) == 0 &&
+                (back - 3 == line_start || !is_ident_char((unsigned char)back[-4]))) {
+                is_ext = true;
+            }
+            p += 3;
+            while (*p == ' ' || *p == '\t') p++;
+            while (is_ident_char((unsigned char)*p)) p++;
+            while (*p == ' ' || *p == '\t') p++;
+            if (*p == '(') {
+                p++;
+                long long cur_l = line;
+                const char *cur_ls = line_start;
+                int paren_depth = 1;
+                while (*p && paren_depth > 0) {
+                    while (*p == ' ' || *p == '\t' || *p == ',') p++;
+                    if (*p == '\n') {
+                        cur_l++;
+                        cur_ls = p + 1;
+                        p++;
+                        continue;
+                    }
+                    if (*p == ')') {
+                        paren_depth--;
+                        p++;
+                        break;
+                    }
+                    const char *param_start = p;
+                    long long param_l = cur_l;
+                    const char *param_ls = cur_ls;
+                    if (is_ident_start((unsigned char)*p)) {
+                        const char *pname = p;
+                        while (is_ident_char((unsigned char)*p)) p++;
+                        size_t pname_len = (size_t)(p - pname);
+                        int pcol = (int)(pname - param_ls);
+                        while (*p && paren_depth > 0) {
+                            if (*p == '(') {
+                                paren_depth++;
+                            } else if (*p == ')') {
+                                if (paren_depth == 1) break;
+                                paren_depth--;
+                            } else if (*p == ',' && paren_depth == 1) {
+                                break;
+                            } else if (*p == '\n') {
+                                cur_l++;
+                                cur_ls = p + 1;
+                            }
+                            p++;
+                        }
+                        const char *pend = p;
+                        while (pend > param_start && (pend[-1] == ' ' || pend[-1] == '\t' || pend[-1] == '\r' || pend[-1] == '\n')) {
+                            pend--;
+                        }
+                        if (param_l < cursor_line || (param_l == cursor_line && pcol <= cursor_col)) {
+                            if (!is_ext || param_l == cursor_line) {
+                                add_local_entry(&entries, &entry_count, pname, pname_len,
+                                                param_start, (size_t)(pend - param_start),
+                                                13, (int)param_l, pcol, 1);
+                            }
+                        }
+                    } else {
+                        if (*p == '(') paren_depth++;
+                        else if (*p == ')') paren_depth--;
+                        p++;
+                    }
+                }
+                line = cur_l;
+                line_start = cur_ls;
+            }
+            continue;
+        }
+
+        if (is_kw_at(p, text, "var", 3) || (scope_depth > 0 && is_kw_at(p, text, "const", 5))) {
+            bool is_const = (*p == 'c');
+            const char *decl_start = p;
+            p += is_const ? 5 : 3;
+            while (*p == ' ' || *p == '\t') p++;
+            if (is_ident_start((unsigned char)*p)) {
+                const char *name_start = p;
+                while (is_ident_char((unsigned char)*p)) p++;
+                size_t name_len = (size_t)(p - name_start);
+                int name_col = (int)(name_start - line_start);
+                if (line < cursor_line || (line == cursor_line && name_col <= cursor_col)) {
+                    const char *d_end = p;
+                    while (*d_end && *d_end != ';' && *d_end != '{' && *d_end != '\n' && *d_end != '\r') {
+                        d_end++;
+                    }
+                    while (d_end > decl_start && (d_end[-1] == ' ' || d_end[-1] == '\t')) {
+                        d_end--;
+                    }
+                    int sym_depth = (!is_const && in_for_header) ? (scope_depth + 1) : scope_depth;
+                    add_local_entry(&entries, &entry_count, name_start, name_len,
+                                    decl_start, (size_t)(d_end - decl_start),
+                                    is_const ? 14 : 13, (int)line, name_col, sym_depth);
+                }
+            }
+            continue;
+        }
+
+        p++;
+    }
+
+    if (entry_count > 0) {
+        *out_syms = malloc(entry_count * sizeof(Symbol));
+        for (size_t i = 0; i < entry_count; i++) {
+            (*out_syms)[i] = entries[i].sym;
+        }
+        *out_count = entry_count;
+    }
+    free(entries);
+}
+
 static const Symbol *find_symbol_in(const Symbol *syms, size_t count, const char *name, bool pub_only)
 {
     for (size_t i = 0; i < count; i++) {
@@ -1060,6 +1321,7 @@ static const Symbol *find_symbol_in(const Symbol *syms, size_t count, const char
 }
 
 static bool resolve_symbol_target(const Document *doc, const char *word, const char *qual,
+                                  long long line, long long col,
                                   char **out_uri, Symbol *out_sym)
 {
     if (qual) {
@@ -1086,6 +1348,22 @@ static bool resolve_symbol_target(const Document *doc, const char *word, const c
         free_symbol_list(mod_syms, mod_count);
         return false;
     }
+
+    Symbol *locals = NULL;
+    size_t local_count = 0;
+    collect_local_symbols_at(doc, line, col, &locals, &local_count);
+    for (size_t i = local_count; i > 0; i--) {
+        const Symbol *loc = &locals[i - 1];
+        if (strcmp(loc->name, word) == 0) {
+            *out_uri = strdup(doc->uri);
+            *out_sym = *loc;
+            out_sym->name = strdup(loc->name);
+            out_sym->detail = strdup(loc->detail);
+            free_symbol_list(locals, local_count);
+            return true;
+        }
+    }
+    free_symbol_list(locals, local_count);
 
     const Symbol *local = find_symbol_in(doc->symbols, doc->symbol_count, word, false);
     if (local) {
@@ -1214,7 +1492,7 @@ static void handle_hover(const char *id_raw, const char *params)
     char *target_uri = NULL;
     Symbol sym = {0};
     const char *detail = NULL;
-    bool resolved = resolve_symbol_target(doc, word, qual, &target_uri, &sym);
+    bool resolved = resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym);
     if (resolved) {
         detail = sym.detail;
     } else if (!qual) {
@@ -1265,7 +1543,7 @@ static void handle_definition(const char *id_raw, const char *params)
     char *target_uri = NULL;
     Symbol sym = {0};
     if (!ident_and_qualifier_at(doc, line, col, &word, &qual) ||
-        !resolve_symbol_target(doc, word, qual, &target_uri, &sym)) {
+        !resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym)) {
         send_response(id_raw, "null");
     } else {
         StrBuf sb;
@@ -1310,7 +1588,7 @@ static void append_completion_item(StrBuf *sb, bool *first, const char *label,
 
 static int symbol_to_completion_kind(int sym_kind)
 {
-    return sym_kind == 12 ? 3 : sym_kind == 23 ? 22 : sym_kind == 10 ? 13 : 21;
+    return sym_kind == 12 ? 3 : sym_kind == 23 ? 22 : sym_kind == 10 ? 13 : sym_kind == 13 ? 6 : 21;
 }
 
 static void append_module_dir_completions(StrBuf *sb, bool *first, const char *doc_path,
@@ -1502,6 +1780,17 @@ static void handle_completion(const char *id_raw, const char *params)
         append_completion_item(&sb, &first, builtins[i], 3, builtin_doc(builtins[i]));
     }
     if (doc) {
+        if (has_pos) {
+            Symbol *locals = NULL;
+            size_t local_count = 0;
+            collect_local_symbols_at(doc, line, col, &locals, &local_count);
+            for (size_t i = 0; i < local_count; i++) {
+                append_completion_item(&sb, &first, locals[i].name,
+                                       symbol_to_completion_kind(locals[i].kind),
+                                       locals[i].detail);
+            }
+            free_symbol_list(locals, local_count);
+        }
         for (size_t i = 0; i < doc->symbol_count; i++) {
             append_completion_item(&sb, &first, doc->symbols[i].name,
                                    symbol_to_completion_kind(doc->symbols[i].kind),
