@@ -440,35 +440,49 @@ static char *resolve_std_dir(const char *doc_path)
     return NULL;
 }
 
-static char *resolve_module_file(const char *doc_path, const char *mod_path)
+static char *resolve_project_root(const char *doc_path, char **out_entry_file)
 {
-    if (!mod_path || !*mod_path) {
-        return NULL;
+    if (out_entry_file) *out_entry_file = NULL;
+    char *cur = dir_of(doc_path ? doc_path : ".");
+    if (!cur) return NULL;
+
+    char *probe = strdup(cur);
+    for (int depth = 0; depth < 8 && probe && *probe; depth++) {
+        StrBuf candidate;
+        sb_init(&candidate);
+        sb_append(&candidate, probe);
+        sb_append(&candidate, "/main.lunso");
+        if (is_file(candidate.data)) {
+            if (out_entry_file) {
+                *out_entry_file = candidate.data;
+            } else {
+                free(candidate.data);
+            }
+            free(cur);
+            return probe;
+        }
+        free(candidate.data);
+
+        char *slash = strrchr(probe, '/');
+        if (!slash || slash == probe) {
+            break;
+        }
+        *slash = '\0';
     }
+    free(probe);
+    return cur;
+}
+
+static char *resolve_module_file_in(const char *base_dir, const char *rest)
+{
     StrBuf rel;
     sb_init(&rel);
-    const char *rest = mod_path;
-    char *base_dir = NULL;
-
-    if (strncmp(mod_path, "std.", 4) == 0) {
-        char *std_dir = resolve_std_dir(doc_path);
-        if (std_dir) {
-            base_dir = std_dir;
-            rest = mod_path + 4;
-        }
-    }
-    if (!base_dir) {
-        base_dir = dir_of(doc_path ? doc_path : ".");
-    }
-
     sb_append(&rel, base_dir);
     sb_append_char(&rel, '/');
     for (const char *p = rest; *p; p++) {
         sb_append_char(&rel, *p == '.' ? '/' : *p);
     }
     sb_append(&rel, ".lunso");
-    free(base_dir);
-
     if (is_file(rel.data)) {
         return rel.data;
     }
@@ -476,29 +490,32 @@ static char *resolve_module_file(const char *doc_path, const char *mod_path)
     return NULL;
 }
 
-static char *resolve_module_dir(const char *doc_path, const char *mod_prefix)
+static char *resolve_module_file(const char *doc_path, const char *mod_path)
 {
-    if (!mod_prefix || !*mod_prefix) {
-        return dir_of(doc_path ? doc_path : ".");
+    if (!mod_path || !*mod_path) {
+        return NULL;
     }
-    if (strcmp(mod_prefix, "std") == 0) {
+    if (strncmp(mod_path, "std.", 4) == 0) {
         char *std_dir = resolve_std_dir(doc_path);
         if (std_dir) {
-            return std_dir;
+            char *res = resolve_module_file_in(std_dir, mod_path + 4);
+            free(std_dir);
+            if (res) return res;
         }
     }
-    const char *rest = mod_prefix;
-    char *base_dir = NULL;
-    if (strncmp(mod_prefix, "std.", 4) == 0) {
-        char *std_dir = resolve_std_dir(doc_path);
-        if (std_dir) {
-            base_dir = std_dir;
-            rest = mod_prefix + 4;
-        }
-    }
-    if (!base_dir) {
-        base_dir = dir_of(doc_path ? doc_path : ".");
-    }
+    char *doc_dir = dir_of(doc_path ? doc_path : ".");
+    char *res = doc_dir ? resolve_module_file_in(doc_dir, mod_path) : NULL;
+    free(doc_dir);
+    if (res) return res;
+
+    char *proj_root = resolve_project_root(doc_path, NULL);
+    res = proj_root ? resolve_module_file_in(proj_root, mod_path) : NULL;
+    free(proj_root);
+    return res;
+}
+
+static char *resolve_module_dir_in(const char *base_dir, const char *rest)
+{
     StrBuf dir;
     sb_init(&dir);
     sb_append(&dir, base_dir);
@@ -506,12 +523,41 @@ static char *resolve_module_dir(const char *doc_path, const char *mod_prefix)
     for (const char *p = rest; *p; p++) {
         sb_append_char(&dir, *p == '.' ? '/' : *p);
     }
-    free(base_dir);
     if (is_dir(dir.data)) {
         return dir.data;
     }
     free(dir.data);
     return NULL;
+}
+
+static char *resolve_module_dir(const char *doc_path, const char *mod_prefix)
+{
+    if (!mod_prefix || !*mod_prefix) {
+        return resolve_project_root(doc_path, NULL);
+    }
+    if (strcmp(mod_prefix, "std") == 0) {
+        char *std_dir = resolve_std_dir(doc_path);
+        if (std_dir) {
+            return std_dir;
+        }
+    }
+    if (strncmp(mod_prefix, "std.", 4) == 0) {
+        char *std_dir = resolve_std_dir(doc_path);
+        if (std_dir) {
+            char *res = resolve_module_dir_in(std_dir, mod_prefix + 4);
+            free(std_dir);
+            if (res) return res;
+        }
+    }
+    char *doc_dir = dir_of(doc_path ? doc_path : ".");
+    char *res = doc_dir ? resolve_module_dir_in(doc_dir, mod_prefix) : NULL;
+    free(doc_dir);
+    if (res) return res;
+
+    char *proj_root = resolve_project_root(doc_path, NULL);
+    res = proj_root ? resolve_module_dir_in(proj_root, mod_prefix) : NULL;
+    free(proj_root);
+    return res;
 }
 
 static char *read_file_text(const char *path)
@@ -905,27 +951,45 @@ static const char *resolve_lunso_bin(void)
 
 static void publish_diagnostics(Document *doc)
 {
-    const char *slash = strrchr(doc->path, '/');
-    size_t dir_len = slash ? (size_t)(slash - doc->path + 1) : 0;
-    char *tmp_path = malloc(dir_len + 32);
-    if (!tmp_path) {
-        return;
-    }
-    if (dir_len > 0) {
-        memcpy(tmp_path, doc->path, dir_len);
-    }
-    snprintf(tmp_path + dir_len, 32, ".lunso-lsp-%ld.lunso", (long)getpid());
+    char *entry_file = NULL;
+    char *proj_root = resolve_project_root(doc->path, &entry_file);
+    free(proj_root);
 
-    FILE *f = fopen(tmp_path, "wb");
-    if (!f) {
-        free(tmp_path);
-        return;
+    bool use_entry = entry_file && doc->path && strcmp(entry_file, doc->path) != 0;
+    char *tmp_path = NULL;
+    const char *check_target = NULL;
+    const char *match_prefix = NULL;
+
+    if (use_entry) {
+        check_target = entry_file;
+        match_prefix = doc->path;
+    } else {
+        const char *slash = strrchr(doc->path, '/');
+        size_t dir_len = slash ? (size_t)(slash - doc->path + 1) : 0;
+        tmp_path = malloc(dir_len + 32);
+        if (!tmp_path) {
+            free(entry_file);
+            return;
+        }
+        if (dir_len > 0) {
+            memcpy(tmp_path, doc->path, dir_len);
+        }
+        snprintf(tmp_path + dir_len, 32, ".lunso-lsp-%ld.lunso", (long)getpid());
+
+        FILE *f = fopen(tmp_path, "wb");
+        if (!f) {
+            free(tmp_path);
+            free(entry_file);
+            return;
+        }
+        fwrite(doc->text, 1, doc->len, f);
+        fclose(f);
+        check_target = tmp_path;
+        match_prefix = tmp_path;
     }
-    fwrite(doc->text, 1, doc->len, f);
-    fclose(f);
 
     const char *lunso = resolve_lunso_bin();
-    size_t cmd_cap = strlen(lunso) + strlen(tmp_path) + 32;
+    size_t cmd_cap = strlen(lunso) + strlen(check_target) + 32;
     char *cmd = malloc(cmd_cap);
     StrBuf diags;
     sb_init(&diags);
@@ -934,7 +998,7 @@ static void publish_diagnostics(Document *doc)
     sb_append(&diags, ",\"diagnostics\":[");
 
     if (cmd) {
-        snprintf(cmd, cmd_cap, "\"%s\" --check \"%s\" 2>&1", lunso, tmp_path);
+        snprintf(cmd, cmd_cap, "\"%s\" --check \"%s\" 2>&1", lunso, check_target);
         FILE *pipe = popen(cmd, "r");
         if (pipe) {
             char line_buf[1024];
@@ -944,9 +1008,9 @@ static void publish_diagnostics(Document *doc)
                 while (l > 0 && (line_buf[l - 1] == '\n' || line_buf[l - 1] == '\r')) {
                     line_buf[--l] = '\0';
                 }
-                size_t path_len = strlen(tmp_path);
+                size_t path_len = strlen(match_prefix);
                 const char *after = NULL;
-                if (strncmp(line_buf, tmp_path, path_len) == 0 && line_buf[path_len] == ':') {
+                if (strncmp(line_buf, match_prefix, path_len) == 0 && line_buf[path_len] == ':') {
                     after = line_buf + path_len + 1;
                 } else {
                     continue;
@@ -981,8 +1045,11 @@ static void publish_diagnostics(Document *doc)
         free(cmd);
     }
 
-    unlink(tmp_path);
-    free(tmp_path);
+    if (tmp_path) {
+        unlink(tmp_path);
+        free(tmp_path);
+    }
+    free(entry_file);
 
     sb_append(&diags, "]}");
     send_notification("textDocument/publishDiagnostics", diags.data);

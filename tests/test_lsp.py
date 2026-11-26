@@ -340,6 +340,45 @@ class TestLunsoLsp(unittest.TestCase):
             self.assertEqual(diag_err["method"], "textDocument/publishDiagnostics")
             self.assertGreaterEqual(len(diag_err["params"]["diagnostics"]), 1)
 
+            # 8. Submodule in nested directory importing sibling via project root (`main.lunso`)
+            (workdir / "main.lunso").write_text(
+                "import support.sub\n"
+                "fun main(): i32 { return support.sub.use_math(3) }\n",
+                encoding="utf-8",
+            )
+            sub_path = workdir / "support" / "sub.lunso"
+            sub_text = (
+                "import support.math { add_two }\n"
+                "pub fun use_math(x: i32): i32 {\n"
+                "    return add_two(x)\n"
+                "}\n"
+            )
+            sub_path.write_text(sub_text, encoding="utf-8")
+            sub_uri = sub_path.as_uri()
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": sub_uri,
+                        "languageId": "lunso",
+                        "version": 1,
+                        "text": sub_text,
+                    }
+                },
+            })
+            sub_diag = read_msg(proc.stdout)
+            self.assertEqual(sub_diag["params"]["diagnostics"], [])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 79,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 2, "character": 12}},
+            })
+            sub_def = read_msg(proc.stdout)["result"]
+            self.assertEqual(sub_def["uri"], (workdir / "support" / "math.lunso").as_uri())
+
             send({"jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": None})
             self.assertIsNone(read_msg(proc.stdout)["result"])
             send({"jsonrpc": "2.0", "method": "exit", "params": None})
