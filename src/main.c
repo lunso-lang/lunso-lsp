@@ -1674,6 +1674,9 @@ static bool resolve_import_target_at(const Document *doc, long long target_line,
     return false;
 }
 
+static bool resolve_member_target_at(const Document *doc, long long target_line, long long target_col,
+                                     char **out_uri, Symbol *out_sym);
+
 static void handle_hover(const char *id_raw, const char *params)
 {
     const char *td = json_find_field(params, "textDocument");
@@ -1694,12 +1697,13 @@ static void handle_hover(const char *id_raw, const char *params)
     const char *detail = NULL;
     if (resolve_import_target_at(doc, line, col, &target_uri, &sym)) {
         detail = sym.detail;
-    } else if (ident_and_qualifier_at(doc, line, col, &word, &qual)) {
-        if (resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym)) {
-            detail = sym.detail;
-        } else if (!qual) {
-            detail = builtin_doc(word);
-        }
+    } else if (ident_and_qualifier_at(doc, line, col, &word, &qual) &&
+               resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym)) {
+        detail = sym.detail;
+    } else if (resolve_member_target_at(doc, line, col, &target_uri, &sym)) {
+        detail = sym.detail;
+    } else if (word && !qual) {
+        detail = builtin_doc(word);
     }
 
     if (!detail) {
@@ -1748,6 +1752,9 @@ static void handle_definition(const char *id_raw, const char *params)
     bool ok = resolve_import_target_at(doc, line, col, &target_uri, &sym);
     if (!ok && ident_and_qualifier_at(doc, line, col, &word, &qual)) {
         ok = resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym);
+    }
+    if (!ok) {
+        ok = resolve_member_target_at(doc, line, col, &target_uri, &sym);
     }
     if (!ok) {
         send_response(id_raw, "null");
@@ -2064,11 +2071,12 @@ static const char *find_type_decl_body_in_text(const char *text, const char *typ
 }
 
 static const char *find_type_body(const Document *doc, const char *raw_type,
-                                  char **out_owned_text, bool *out_is_enum,
+                                  char **out_owned_text, char **out_uri, bool *out_is_enum,
                                   char ***out_params, size_t *out_param_count,
                                   char ***out_args, size_t *out_arg_count)
 {
     *out_owned_text = NULL;
+    if (out_uri) *out_uri = NULL;
     *out_is_enum = false;
     *out_params = NULL;
     *out_param_count = 0;
@@ -2103,17 +2111,19 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
             char *f_path = resolve_module_file(doc->path, mod_path);
             if (f_path) {
                 char *text = read_file_text(f_path);
-                free(f_path);
                 if (text) {
                     const char *body = find_type_decl_body_in_text(text, tname, out_is_enum,
                                                                    out_params, out_param_count);
                     if (body) {
                         *out_owned_text = text;
+                        if (out_uri) *out_uri = path_to_uri(f_path);
+                        free(f_path);
                         free(type_name);
                         return body;
                     }
                     free(text);
                 }
+                free(f_path);
             }
         }
         free(type_name);
@@ -2126,6 +2136,7 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
     const char *body = find_type_decl_body_in_text(doc->text, type_name, out_is_enum,
                                                    out_params, out_param_count);
     if (body) {
+        if (out_uri) *out_uri = strdup(doc->uri);
         free(type_name);
         return body;
     }
@@ -2147,14 +2158,19 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
         char *f_path = resolve_module_file(doc->path, imp->module_path);
         if (!f_path) continue;
         char *text = read_file_text(f_path);
-        free(f_path);
-        if (!text) continue;
+        if (!text) {
+            free(f_path);
+            continue;
+        }
         body = find_type_decl_body_in_text(text, lookup, out_is_enum, out_params, out_param_count);
         if (body) {
             *out_owned_text = text;
+            if (out_uri) *out_uri = path_to_uri(f_path);
+            free(f_path);
             free(type_name);
             return body;
         }
+        free(f_path);
         free(text);
     }
 
@@ -2165,10 +2181,24 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
     return NULL;
 }
 
-static void scan_type_members(const char *body, bool is_enum,
+static void offset_to_line_col(const char *text, const char *pos, int *out_line, int *out_col)
+{
+    int line = 0;
+    const char *ls = text;
+    for (const char *q = text; q < pos; q++) {
+        if (*q == '\n') {
+            line++;
+            ls = q + 1;
+        }
+    }
+    *out_line = line;
+    *out_col = (int)(pos - ls);
+}
+
+static void scan_type_members(const char *file_text, const char *body, bool is_enum,
                               char *const *params, char *const *args, size_t pair_count,
                               StrBuf *sb, bool *first,
-                              const char *lookup_field, char **out_field_type)
+                              const char *lookup_field, char **out_field_type, Symbol *out_sym)
 {
     if (out_field_type) *out_field_type = NULL;
     const char *p = body;
@@ -2215,7 +2245,24 @@ static void scan_type_members(const char *body, bool is_enum,
                 free(raw_ftype);
                 if (lookup_field) {
                     if (strlen(lookup_field) == name_len && strncmp(lookup_field, name_start, name_len) == 0) {
-                        *out_field_type = ftype;
+                        if (out_sym && file_text) {
+                            char *fname = trim_dup(name_start, name_len);
+                            StrBuf det;
+                            sb_init(&det);
+                            sb_append(&det, fname);
+                            sb_append(&det, ": ");
+                            sb_append(&det, ftype);
+                            out_sym->name = fname;
+                            out_sym->detail = det.data;
+                            out_sym->kind = 5;
+                            offset_to_line_col(file_text, name_start, &out_sym->line, &out_sym->col);
+                            out_sym->end_col = out_sym->col + (int)name_len;
+                        }
+                        if (out_field_type) {
+                            *out_field_type = ftype;
+                        } else {
+                            free(ftype);
+                        }
                         return;
                     }
                     free(ftype);
@@ -2241,7 +2288,18 @@ static void scan_type_members(const char *body, bool is_enum,
                     p++;
                 }
                 tend = p;
-                if (sb && first && !lookup_field) {
+                if (lookup_field) {
+                    if (strlen(lookup_field) == name_len && strncmp(lookup_field, name_start, name_len) == 0) {
+                        if (out_sym && file_text) {
+                            out_sym->name = trim_dup(name_start, name_len);
+                            out_sym->detail = trim_dup(name_start, (size_t)(tend - name_start));
+                            out_sym->kind = 20;
+                            offset_to_line_col(file_text, name_start, &out_sym->line, &out_sym->col);
+                            out_sym->end_col = out_sym->col + (int)name_len;
+                        }
+                        return;
+                    }
+                } else if (sb && first) {
                     char *mname = trim_dup(name_start, name_len);
                     char *detail = trim_dup(name_start, (size_t)(tend - name_start));
                     append_completion_item(sb, first, mname, 20, detail);
@@ -2261,7 +2319,7 @@ static char *lookup_struct_field_type(const Document *doc, const char *type_name
     bool is_enum = false;
     char **params = NULL, **args = NULL;
     size_t param_count = 0, arg_count = 0;
-    const char *body = find_type_body(doc, type_name, &owned, &is_enum,
+    const char *body = find_type_body(doc, type_name, &owned, NULL, &is_enum,
                                       &params, &param_count, &args, &arg_count);
     if (!body || is_enum) {
         free(owned);
@@ -2271,7 +2329,8 @@ static char *lookup_struct_field_type(const Document *doc, const char *type_name
     }
     char *ftype = NULL;
     size_t pair_count = param_count < arg_count ? param_count : arg_count;
-    scan_type_members(body, false, params, args, pair_count, NULL, NULL, field_name, &ftype);
+    scan_type_members(owned ? owned : doc->text, body, false, params, args, pair_count,
+                      NULL, NULL, field_name, &ftype, NULL);
     free(owned);
     free_str_list(params, param_count);
     free_str_list(args, arg_count);
@@ -2284,7 +2343,7 @@ static bool append_type_member_completions(StrBuf *sb, bool *first, const Docume
     bool is_enum = false;
     char **params = NULL, **args = NULL;
     size_t param_count = 0, arg_count = 0;
-    const char *body = find_type_body(doc, type_name, &owned, &is_enum,
+    const char *body = find_type_body(doc, type_name, &owned, NULL, &is_enum,
                                       &params, &param_count, &args, &arg_count);
     if (!body) {
         free(owned);
@@ -2293,7 +2352,8 @@ static bool append_type_member_completions(StrBuf *sb, bool *first, const Docume
         return false;
     }
     size_t pair_count = param_count < arg_count ? param_count : arg_count;
-    scan_type_members(body, is_enum, params, args, pair_count, sb, first, NULL, NULL);
+    scan_type_members(owned ? owned : doc->text, body, is_enum, params, args, pair_count,
+                      sb, first, NULL, NULL, NULL);
     free(owned);
     free_str_list(params, param_count);
     free_str_list(args, arg_count);
@@ -2558,6 +2618,7 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
     if (!lp || qend == 0) return NULL;
     size_t pos = qend;
     while (pos > 0) {
+        bool skipped_group = false;
         while (pos > 0 && (lp[pos - 1] == ']' || lp[pos - 1] == ')')) {
             char close_ch = lp[pos - 1];
             char open_ch = (close_ch == ']') ? '[' : '(';
@@ -2569,6 +2630,7 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
                 else if (lp[pos] == open_ch) depth--;
             }
             if (depth != 0) return NULL;
+            skipped_group = true;
             if (close_ch == ']' && pos > 0 && lp[pos - 1] == '.') {
                 pos--;
             }
@@ -2578,6 +2640,7 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
             pos--;
         }
         if (pos == id_end) {
+            if (skipped_group) break;
             return NULL;
         }
         if (pos > 0 && lp[pos - 1] == '.') {
@@ -2596,6 +2659,78 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
     }
     if (all_digits) return NULL;
     return trim_dup(lp + pos, qend - pos);
+}
+
+static bool resolve_member_target_at(const Document *doc, long long target_line, long long target_col,
+                                     char **out_uri, Symbol *out_sym)
+{
+    *out_uri = NULL;
+    memset(out_sym, 0, sizeof(*out_sym));
+    size_t line_len = 0;
+    const char *lp = line_at(doc, target_line, &line_len);
+    if (!lp || target_col < 0 || (size_t)target_col >= line_len) {
+        return false;
+    }
+    size_t pos = (size_t)target_col;
+    if (!is_ident_char((unsigned char)lp[pos])) {
+        if (pos > 0 && is_ident_char((unsigned char)lp[pos - 1])) {
+            pos--;
+        } else {
+            return false;
+        }
+    }
+    size_t start = pos;
+    while (start > 0 && is_ident_char((unsigned char)lp[start - 1])) start--;
+    size_t end = pos + 1;
+    while (end < line_len && is_ident_char((unsigned char)lp[end])) end++;
+    if (start < 2 || lp[start - 1] != '.') {
+        return false;
+    }
+
+    char *receiver = extract_receiver_expr(lp, start - 1);
+    if (!receiver) {
+        return false;
+    }
+    const char *clean_recv = receiver;
+    while (*clean_recv == '(' || *clean_recv == '*') clean_recv++;
+    char *recv_copy = strdup(clean_recv);
+    size_t rlen = strlen(recv_copy);
+    while (rlen > 0 && recv_copy[rlen - 1] == ')') recv_copy[--rlen] = '\0';
+
+    char *rtype = resolve_expr_type(doc, target_line, target_col, recv_copy);
+    free(recv_copy);
+    free(receiver);
+    if (!rtype) {
+        return false;
+    }
+
+    char *word = trim_dup(lp + start, end - start);
+    char *owned = NULL;
+    char *type_uri = NULL;
+    bool is_enum = false;
+    char **params = NULL, **args = NULL;
+    size_t param_count = 0, arg_count = 0;
+    const char *body = find_type_body(doc, rtype, &owned, &type_uri, &is_enum,
+                                      &params, &param_count, &args, &arg_count);
+    free(rtype);
+    if (body && type_uri) {
+        size_t pair_count = param_count < arg_count ? param_count : arg_count;
+        scan_type_members(owned ? owned : doc->text, body, is_enum, params, args, pair_count,
+                          NULL, NULL, word, NULL, out_sym);
+    }
+    free(word);
+    free(owned);
+    free_str_list(params, param_count);
+    free_str_list(args, arg_count);
+    if (out_sym->name && type_uri) {
+        *out_uri = type_uri;
+        return true;
+    }
+    free(type_uri);
+    free(out_sym->name);
+    free(out_sym->detail);
+    memset(out_sym, 0, sizeof(*out_sym));
+    return false;
 }
 
 static void handle_completion(const char *id_raw, const char *params)

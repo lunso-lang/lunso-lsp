@@ -400,6 +400,40 @@ class TestLunsoLsp(unittest.TestCase):
             self.assertEqual(def_sel["uri"], (workdir / "support" / "math.lunso").as_uri())
             self.assertEqual(def_sel["range"]["start"]["line"], 1)
 
+            # 8c. Hover & Go to definition on struct fields (including generic `tokens.data`)
+            # Re-open `uri` with original source first since step 7 ran `didChange` on `uri`
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "lunso",
+                        "version": 3,
+                        "text": source,
+                    }
+                },
+            })
+            _diag_reopen = read_msg(proc.stdout)
+            send({
+                "jsonrpc": "2.0",
+                "id": 83,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 12}},
+            })
+            hover_field = read_msg(proc.stdout)["result"]
+            self.assertIn("data: *Inner", hover_field["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 84,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 12}},
+            })
+            def_field = read_msg(proc.stdout)["result"]
+            self.assertTrue(def_field["uri"].endswith("/std/vec.lunso"))
+            self.assertEqual(def_field["range"]["start"]["line"], 3)
+
             send({"jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": None})
             self.assertIsNone(read_msg(proc.stdout)["result"])
             send({"jsonrpc": "2.0", "method": "exit", "params": None})
