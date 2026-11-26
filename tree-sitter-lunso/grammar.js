@@ -33,6 +33,10 @@ module.exports = grammar({
 
   word: $ => $.identifier,
 
+  conflicts: $ => [
+    [$._expression, $.struct_literal],
+  ],
+
   rules: {
     source_file: $ => repeat(seq($._top_level, optional(';'))),
 
@@ -77,10 +81,27 @@ module.exports = grammar({
       optional(seq('as', field('alias', $.identifier))),
     ),
 
+    type_parameter_list: $ => seq(
+      '[',
+      alias($.identifier, $.type_identifier),
+      repeat(seq(',', alias($.identifier, $.type_identifier))),
+      optional(','),
+      ']',
+    ),
+
+    type_argument_list: $ => seq(
+      '[',
+      $._type,
+      repeat(seq(',', $._type)),
+      optional(','),
+      ']',
+    ),
+
     function_declaration: $ => seq(
       optional($.visibility),
       'fun',
       field('name', $.identifier),
+      optional(field('type_parameters', $.type_parameter_list)),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $._type))),
       field('body', $.block),
@@ -91,6 +112,7 @@ module.exports = grammar({
       'ext',
       'fun',
       field('name', $.identifier),
+      optional(field('type_parameters', $.type_parameter_list)),
       field('parameters', $.parameter_list),
       optional(seq(':', field('return_type', $._type))),
     ),
@@ -115,6 +137,7 @@ module.exports = grammar({
       optional($.visibility),
       'struct',
       field('name', $.identifier),
+      optional(field('type_parameters', $.type_parameter_list)),
       '{',
       repeat(seq($.field_declaration, optional(';'))),
       '}',
@@ -156,11 +179,13 @@ module.exports = grammar({
       $.pointer_type,
       $.array_type,
       $.slice_type,
+      $.generic_type,
       $.qualified_type,
       alias($.identifier, $.type_identifier),
     ),
 
     primitive_type: _ => choice(
+      'int',
       'i8', 'i16', 'i32', 'i64',
       'u8', 'u16', 'u32', 'u64',
       'f32', 'f64', 'bool',
@@ -170,6 +195,10 @@ module.exports = grammar({
     array_type: $ => seq('[', choice($.integer_literal, $.identifier), ']', $._type),
     slice_type: $ => seq('[', ']', $._type),
     qualified_type: $ => prec(1, seq($.identifier, repeat1(seq('.', $.identifier)))),
+    generic_type: $ => prec(2, seq(
+      choice($.qualified_type, alias($.identifier, $.type_identifier)),
+      $.type_argument_list,
+    )),
 
     block: $ => seq(
       '{',
@@ -247,6 +276,7 @@ module.exports = grammar({
       $.unary_expression,
       $.cast_expression,
       $.call_expression,
+      $.generic_expression,
       $.index_expression,
       $.slice_expression,
       $.member_expression,
@@ -338,8 +368,15 @@ module.exports = grammar({
       field('member', $.identifier),
     )),
 
-    struct_literal: $ => prec(-1, seq(
+    generic_expression: $ => prec.left(PREC.POSTFIX, seq(
+      field('function', $._expression),
+      '.',
+      field('type_arguments', $.type_argument_list),
+    )),
+
+    struct_literal: $ => prec.dynamic(-1, seq(
       field('type', choice($.identifier, $.member_expression)),
+      optional(field('type_arguments', $.type_argument_list)),
       '{',
       optional(seq(
         $.struct_field_init,

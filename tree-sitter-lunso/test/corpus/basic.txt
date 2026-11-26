@@ -92,3 +92,86 @@ pub fun add(x: i32, y: i32): i32 {
             (identifier))
           (return_statement
             (integer_literal)))))))
+
+==================
+Generics and specializations
+==================
+
+pub struct Vec[T] {
+    data: *T
+    len: u64
+}
+
+pub fun push[T](v: *Vec[T], x: T): T {
+    return x
+}
+
+fun main(): i32 {
+    var nums = Vec[int] { data: 0 as *int, len: 0 }
+    return push.[int](&nums, 42)
+}
+
+---
+
+(source_file
+  (struct_declaration
+    (visibility)
+    (identifier)
+    (type_parameter_list
+      (type_identifier))
+    (field_declaration
+      (identifier)
+      (pointer_type
+        (type_identifier)))
+    (field_declaration
+      (identifier)
+      (primitive_type)))
+  (function_declaration
+    (visibility)
+    (identifier)
+    (type_parameter_list
+      (type_identifier))
+    (parameter_list
+      (parameter
+        (identifier)
+        (pointer_type
+          (generic_type
+            (type_identifier)
+            (type_argument_list
+              (type_identifier)))))
+      (parameter
+        (identifier)
+        (type_identifier)))
+    (type_identifier)
+    (block
+      (return_statement
+        (identifier))))
+  (function_declaration
+    (identifier)
+    (parameter_list)
+    (primitive_type)
+    (block
+      (var_statement
+        (identifier)
+        (struct_literal
+          (identifier)
+          (type_argument_list
+            (primitive_type))
+          (struct_field_init
+            (identifier)
+            (cast_expression
+              (integer_literal)
+              (pointer_type
+                (primitive_type))))
+          (struct_field_init
+            (identifier)
+            (integer_literal))))
+      (return_statement
+        (call_expression
+          (generic_expression
+            (identifier)
+            (type_argument_list
+              (primitive_type)))
+          (unary_expression
+            (identifier))
+          (integer_literal))))))

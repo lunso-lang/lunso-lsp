@@ -32,6 +32,8 @@
 (extern_function_declaration name: (identifier) @function)
 (call_expression function: (identifier) @function)
 (call_expression function: (member_expression member: (identifier) @function.method))
+(call_expression function: (generic_expression function: (identifier) @function))
+(call_expression function: (generic_expression function: (member_expression member: (identifier) @function.method)))
 
 ; Variables, parameters, fields, constants
 (parameter name: (identifier) @variable.parameter)

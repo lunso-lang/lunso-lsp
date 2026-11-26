@@ -1207,11 +1207,26 @@ static void collect_local_symbols_at(const Document *doc, long long cursor_line,
             while (*p == ' ' || *p == '\t') p++;
             while (is_ident_char((unsigned char)*p)) p++;
             while (*p == ' ' || *p == '\t') p++;
+            if (*p == '[') {
+                int bd = 1;
+                p++;
+                while (*p && bd > 0) {
+                    if (*p == '[') bd++;
+                    else if (*p == ']') bd--;
+                    else if (*p == '\n') {
+                        line++;
+                        line_start = p + 1;
+                    }
+                    p++;
+                }
+                while (*p == ' ' || *p == '\t') p++;
+            }
             if (*p == '(') {
                 p++;
                 long long cur_l = line;
                 const char *cur_ls = line_start;
                 int paren_depth = 1;
+                int bracket_depth = 0;
                 while (*p && paren_depth > 0) {
                     while (*p == ' ' || *p == '\t' || *p == ',') p++;
                     if (*p == '\n') {
@@ -1239,7 +1254,11 @@ static void collect_local_symbols_at(const Document *doc, long long cursor_line,
                             } else if (*p == ')') {
                                 if (paren_depth == 1) break;
                                 paren_depth--;
-                            } else if (*p == ',' && paren_depth == 1) {
+                            } else if (*p == '[') {
+                                bracket_depth++;
+                            } else if (*p == ']') {
+                                if (bracket_depth > 0) bracket_depth--;
+                            } else if (*p == ',' && paren_depth == 1 && bracket_depth == 0) {
                                 break;
                             } else if (*p == '\n') {
                                 cur_l++;
@@ -1664,6 +1683,15 @@ static char *strip_one_index_type(const char *type_str)
     if (!type_str) return NULL;
     const char *p = type_str;
     while (*p == ' ' || *p == '\t') p++;
+    if (*p == '*') {
+        p++;
+        while (*p == ' ' || *p == '\t') p++;
+        if (strncmp(p, "const", 5) == 0 && (p[5] == ' ' || p[5] == '\t' || p[5] == '*')) {
+            p += 5;
+            while (*p == ' ' || *p == '\t') p++;
+        }
+        return trim_dup(p, strlen(p));
+    }
     if (*p != '[') return NULL;
     p++;
     int depth = 1;
@@ -1681,8 +1709,127 @@ static char *strip_one_index_type(const char *type_str)
     return trim_dup(p, strlen(p));
 }
 
-static const char *find_type_decl_body_in_text(const char *text, const char *type_name, bool *out_is_enum)
+static void free_str_list(char **items, size_t count)
 {
+    for (size_t i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+static void parse_bracket_list(const char *bracket_start, char ***out_items, size_t *out_count)
+{
+    *out_items = NULL;
+    *out_count = 0;
+    if (!bracket_start || *bracket_start != '[') return;
+    const char *p = bracket_start + 1;
+    const char *item_start = p;
+    int depth = 1;
+    while (*p && depth > 0) {
+        if (*p == '[') {
+            depth++;
+        } else if (*p == ']') {
+            depth--;
+            if (depth == 0) {
+                char *item = trim_dup(item_start, (size_t)(p - item_start));
+                if (item && *item) {
+                    char **grown = realloc(*out_items, (*out_count + 1) * sizeof(*grown));
+                    if (grown) {
+                        *out_items = grown;
+                        (*out_items)[(*out_count)++] = item;
+                    } else {
+                        free(item);
+                    }
+                } else {
+                    free(item);
+                }
+                break;
+            }
+        } else if (*p == ',' && depth == 1) {
+            char *item = trim_dup(item_start, (size_t)(p - item_start));
+            if (item && *item) {
+                char **grown = realloc(*out_items, (*out_count + 1) * sizeof(*grown));
+                if (grown) {
+                    *out_items = grown;
+                    (*out_items)[(*out_count)++] = item;
+                } else {
+                    free(item);
+                }
+            } else {
+                free(item);
+            }
+            item_start = p + 1;
+        }
+        p++;
+    }
+}
+
+static void split_generic_type_args(const char *type_name, char **out_base,
+                                    char ***out_args, size_t *out_arg_count)
+{
+    *out_args = NULL;
+    *out_arg_count = 0;
+    size_t len = type_name ? strlen(type_name) : 0;
+    if (len == 0 || type_name[len - 1] != ']') {
+        *out_base = strdup(type_name ? type_name : "");
+        return;
+    }
+    int depth = 1;
+    size_t pos = len - 1;
+    while (pos > 0 && depth > 0) {
+        pos--;
+        if (type_name[pos] == ']') depth++;
+        else if (type_name[pos] == '[') depth--;
+    }
+    if (depth != 0 || pos == 0 || !is_ident_char((unsigned char)type_name[pos - 1])) {
+        *out_base = strdup(type_name);
+        return;
+    }
+    *out_base = trim_dup(type_name, pos);
+    parse_bracket_list(type_name + pos, out_args, out_arg_count);
+}
+
+static char *substitute_type_params(const char *type_str, char *const *params,
+                                    char *const *args, size_t pair_count)
+{
+    if (!type_str) return NULL;
+    if (pair_count == 0 || !params || !args) {
+        return strdup(type_str);
+    }
+    StrBuf sb;
+    sb_init(&sb);
+    const char *p = type_str;
+    while (*p) {
+        if (is_ident_start((unsigned char)*p) &&
+            (p == type_str || (!is_ident_char((unsigned char)p[-1]) && p[-1] != '.'))) {
+            const char *id_start = p;
+            while (is_ident_char((unsigned char)*p)) p++;
+            size_t id_len = (size_t)(p - id_start);
+            bool replaced = false;
+            for (size_t i = 0; i < pair_count; i++) {
+                if (strlen(params[i]) == id_len && strncmp(params[i], id_start, id_len) == 0) {
+                    sb_append(&sb, args[i]);
+                    replaced = true;
+                    break;
+                }
+            }
+            if (!replaced) {
+                sb_append_n(&sb, id_start, id_len);
+            }
+        } else {
+            sb_append_char(&sb, *p);
+            p++;
+        }
+    }
+    return sb.data;
+}
+
+static const char *find_type_decl_body_in_text(const char *text, const char *type_name,
+                                               bool *out_is_enum,
+                                               char ***out_params, size_t *out_param_count)
+{
+    if (out_params) *out_params = NULL;
+    if (out_param_count) *out_param_count = 0;
     if (!text || !type_name || !*type_name) return NULL;
     size_t tlen = strlen(type_name);
     const char *p = text;
@@ -1703,11 +1850,22 @@ static const char *find_type_decl_body_in_text(const char *text, const char *typ
             if (is_struct || is_enum) {
                 cur += is_struct ? 7 : 5;
                 while (*cur == ' ' || *cur == '\t') cur++;
-                if (strncmp(cur, type_name, tlen) == 0 && !is_ident_char((unsigned char)cur[tlen])) {
-                    const char *brace = strchr(cur + tlen, '{');
+                if (strncmp(cur, type_name, tlen) == 0 &&
+                    (cur[tlen] == '[' || !is_ident_char((unsigned char)cur[tlen]))) {
+                    const char *after = cur + tlen;
+                    while (*after == ' ' || *after == '\t') after++;
+                    if (is_struct && *after == '[' && out_params && out_param_count) {
+                        parse_bracket_list(after, out_params, out_param_count);
+                    }
+                    const char *brace = strchr(after, '{');
                     if (brace) {
                         *out_is_enum = is_enum;
                         return brace + 1;
+                    }
+                    if (out_params && out_param_count) {
+                        free_str_list(*out_params, *out_param_count);
+                        *out_params = NULL;
+                        *out_param_count = 0;
                     }
                 }
             }
@@ -1719,13 +1877,29 @@ static const char *find_type_decl_body_in_text(const char *text, const char *typ
 }
 
 static const char *find_type_body(const Document *doc, const char *raw_type,
-                                  char **out_owned_text, bool *out_is_enum)
+                                  char **out_owned_text, bool *out_is_enum,
+                                  char ***out_params, size_t *out_param_count,
+                                  char ***out_args, size_t *out_arg_count)
 {
     *out_owned_text = NULL;
     *out_is_enum = false;
-    char *type_name = strip_pointer_prefix(raw_type);
+    *out_params = NULL;
+    *out_param_count = 0;
+    *out_args = NULL;
+    *out_arg_count = 0;
+    char *stripped = strip_pointer_prefix(raw_type);
+    if (!stripped || !*stripped) {
+        free(stripped);
+        return NULL;
+    }
+    char *type_name = NULL;
+    split_generic_type_args(stripped, &type_name, out_args, out_arg_count);
+    free(stripped);
     if (!type_name || !*type_name) {
         free(type_name);
+        free_str_list(*out_args, *out_arg_count);
+        *out_args = NULL;
+        *out_arg_count = 0;
         return NULL;
     }
 
@@ -1744,7 +1918,8 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
                 char *text = read_file_text(f_path);
                 free(f_path);
                 if (text) {
-                    const char *body = find_type_decl_body_in_text(text, tname, out_is_enum);
+                    const char *body = find_type_decl_body_in_text(text, tname, out_is_enum,
+                                                                   out_params, out_param_count);
                     if (body) {
                         *out_owned_text = text;
                         free(type_name);
@@ -1755,10 +1930,14 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
             }
         }
         free(type_name);
+        free_str_list(*out_args, *out_arg_count);
+        *out_args = NULL;
+        *out_arg_count = 0;
         return NULL;
     }
 
-    const char *body = find_type_decl_body_in_text(doc->text, type_name, out_is_enum);
+    const char *body = find_type_decl_body_in_text(doc->text, type_name, out_is_enum,
+                                                   out_params, out_param_count);
     if (body) {
         free(type_name);
         return body;
@@ -1783,7 +1962,7 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
         char *text = read_file_text(f_path);
         free(f_path);
         if (!text) continue;
-        body = find_type_decl_body_in_text(text, lookup, out_is_enum);
+        body = find_type_decl_body_in_text(text, lookup, out_is_enum, out_params, out_param_count);
         if (body) {
             *out_owned_text = text;
             free(type_name);
@@ -1793,10 +1972,14 @@ static const char *find_type_body(const Document *doc, const char *raw_type,
     }
 
     free(type_name);
+    free_str_list(*out_args, *out_arg_count);
+    *out_args = NULL;
+    *out_arg_count = 0;
     return NULL;
 }
 
 static void scan_type_members(const char *body, bool is_enum,
+                              char *const *params, char *const *args, size_t pair_count,
                               StrBuf *sb, bool *first,
                               const char *lookup_field, char **out_field_type)
 {
@@ -1840,7 +2023,9 @@ static void scan_type_members(const char *body, bool is_enum,
                     if (*p == '/' && p[1] == '/') break;
                     p++;
                 }
-                char *ftype = trim_dup(type_start, (size_t)(p - type_start));
+                char *raw_ftype = trim_dup(type_start, (size_t)(p - type_start));
+                char *ftype = substitute_type_params(raw_ftype, params, args, pair_count);
+                free(raw_ftype);
                 if (lookup_field) {
                     if (strlen(lookup_field) == name_len && strncmp(lookup_field, name_start, name_len) == 0) {
                         *out_field_type = ftype;
@@ -1849,10 +2034,14 @@ static void scan_type_members(const char *body, bool is_enum,
                     free(ftype);
                 } else if (sb && first) {
                     char *fname = trim_dup(name_start, name_len);
-                    char *detail = trim_dup(name_start, (size_t)(p - name_start));
-                    append_completion_item(sb, first, fname, 5, detail);
+                    StrBuf det;
+                    sb_init(&det);
+                    sb_append(&det, fname);
+                    sb_append(&det, ": ");
+                    sb_append(&det, ftype);
+                    append_completion_item(sb, first, fname, 5, det.data);
+                    free(det.data);
                     free(fname);
-                    free(detail);
                     free(ftype);
                 } else {
                     free(ftype);
@@ -1883,14 +2072,22 @@ static char *lookup_struct_field_type(const Document *doc, const char *type_name
 {
     char *owned = NULL;
     bool is_enum = false;
-    const char *body = find_type_body(doc, type_name, &owned, &is_enum);
+    char **params = NULL, **args = NULL;
+    size_t param_count = 0, arg_count = 0;
+    const char *body = find_type_body(doc, type_name, &owned, &is_enum,
+                                      &params, &param_count, &args, &arg_count);
     if (!body || is_enum) {
         free(owned);
+        free_str_list(params, param_count);
+        free_str_list(args, arg_count);
         return NULL;
     }
     char *ftype = NULL;
-    scan_type_members(body, false, NULL, NULL, field_name, &ftype);
+    size_t pair_count = param_count < arg_count ? param_count : arg_count;
+    scan_type_members(body, false, params, args, pair_count, NULL, NULL, field_name, &ftype);
     free(owned);
+    free_str_list(params, param_count);
+    free_str_list(args, arg_count);
     return ftype;
 }
 
@@ -1898,20 +2095,28 @@ static bool append_type_member_completions(StrBuf *sb, bool *first, const Docume
 {
     char *owned = NULL;
     bool is_enum = false;
-    const char *body = find_type_body(doc, type_name, &owned, &is_enum);
+    char **params = NULL, **args = NULL;
+    size_t param_count = 0, arg_count = 0;
+    const char *body = find_type_body(doc, type_name, &owned, &is_enum,
+                                      &params, &param_count, &args, &arg_count);
     if (!body) {
         free(owned);
+        free_str_list(params, param_count);
+        free_str_list(args, arg_count);
         return false;
     }
-    scan_type_members(body, is_enum, sb, first, NULL, NULL);
+    size_t pair_count = param_count < arg_count ? param_count : arg_count;
+    scan_type_members(body, is_enum, params, args, pair_count, sb, first, NULL, NULL);
     free(owned);
+    free_str_list(params, param_count);
+    free_str_list(args, arg_count);
     return true;
 }
 
 static char *resolve_expr_type(const Document *doc, long long line, long long col, const char *expr);
 
 static char *type_from_symbol_detail(const Document *doc, long long line, long long col,
-                                     const Symbol *sym, bool is_call)
+                                     const Symbol *sym, bool is_call, const char *call_type_args)
 {
     if (!sym || !sym->detail) return NULL;
     const char *d = sym->detail;
@@ -1932,7 +2137,25 @@ static char *type_from_symbol_detail(const Document *doc, long long line, long l
         p++;
         const char *end = p;
         while (*end && *end != '{' && *end != '\n' && *end != '\r') end++;
-        return trim_dup(p, (size_t)(end - p));
+        char *ret = trim_dup(p, (size_t)(end - p));
+        if (ret && call_type_args && *call_type_args == '[') {
+            const char *fn_bracket = strchr(d, '[');
+            if (fn_bracket && fn_bracket < lp) {
+                char **fparams = NULL, **fargs = NULL;
+                size_t fp_count = 0, fa_count = 0;
+                parse_bracket_list(fn_bracket, &fparams, &fp_count);
+                parse_bracket_list(call_type_args, &fargs, &fa_count);
+                size_t pairs = fp_count < fa_count ? fp_count : fa_count;
+                if (pairs > 0) {
+                    char *sub = substitute_type_params(ret, fparams, fargs, pairs);
+                    free(ret);
+                    ret = sub;
+                }
+                free_str_list(fparams, fp_count);
+                free_str_list(fargs, fa_count);
+            }
+        }
+        return ret;
     }
     if (sym->kind == 23 || sym->kind == 10) { // Struct / Enum
         return strdup(sym->name);
@@ -1961,6 +2184,15 @@ static char *type_from_symbol_detail(const Document *doc, long long line, long l
             if (is_ident_start((unsigned char)*elem)) {
                 const char *es = elem;
                 while (is_ident_char((unsigned char)*elem) || *elem == '.') elem++;
+                if (*elem == '[') {
+                    int bd = 1;
+                    elem++;
+                    while (*elem && bd > 0) {
+                        if (*elem == '[') bd++;
+                        else if (*elem == ']') bd--;
+                        elem++;
+                    }
+                }
                 const char *sp = elem;
                 while (*sp == ' ' || *sp == '\t') sp++;
                 if (*sp == '{') {
@@ -1976,6 +2208,15 @@ static char *type_from_symbol_detail(const Document *doc, long long line, long l
         } else if (is_ident_start((unsigned char)*after_name)) {
             const char *is = after_name;
             while (is_ident_char((unsigned char)*after_name) || *after_name == '.') after_name++;
+            if (*after_name == '[') {
+                int bd = 1;
+                after_name++;
+                while (*after_name && bd > 0) {
+                    if (*after_name == '[') bd++;
+                    else if (*after_name == ']') bd--;
+                    after_name++;
+                }
+            }
             const char *sp = after_name;
             while (*sp == ' ' || *sp == '\t') sp++;
             if (*sp == '{') {
@@ -1997,7 +2238,8 @@ static char *type_from_symbol_detail(const Document *doc, long long line, long l
 }
 
 static char *resolve_base_ident_type(const Document *doc, long long line, long long col,
-                                     const char *name, bool is_call, char **out_mod_alias)
+                                     const char *name, bool is_call, const char *call_type_args,
+                                     char **out_mod_alias)
 {
     if (out_mod_alias) *out_mod_alias = NULL;
     if (!is_call) {
@@ -2010,7 +2252,7 @@ static char *resolve_base_ident_type(const Document *doc, long long line, long l
     Symbol sym = {0};
     char *target_uri = NULL;
     if (resolve_symbol_target(doc, name, NULL, line, col, &target_uri, &sym)) {
-        char *t = type_from_symbol_detail(doc, line, col, &sym, is_call);
+        char *t = type_from_symbol_detail(doc, line, col, &sym, is_call, call_type_args);
         free(target_uri);
         free(sym.name);
         free(sym.detail);
@@ -2036,6 +2278,23 @@ static char *resolve_expr_type(const Document *doc, long long line, long long co
         const char *id_start = p;
         while (is_ident_char((unsigned char)*p)) p++;
         char *ident = trim_dup(id_start, (size_t)(p - id_start));
+
+        char *type_args = NULL;
+        if (p[0] == '.' && p[1] == '[') {
+            const char *ta_start = p + 1;
+            const char *ta = ta_start + 1;
+            int bd = 1;
+            while (*ta && bd > 0) {
+                if (*ta == '[') bd++;
+                else if (*ta == ']') bd--;
+                ta++;
+            }
+            if (bd == 0) {
+                type_args = trim_dup(ta_start, (size_t)(ta - ta_start));
+                p = ta;
+            }
+        }
+
         bool is_call = false;
         if (*p == '(') {
             is_call = true;
@@ -2050,7 +2309,7 @@ static char *resolve_expr_type(const Document *doc, long long line, long long co
 
         if (first_seg) {
             first_seg = false;
-            cur_type = resolve_base_ident_type(doc, line, col, ident, is_call, &cur_mod);
+            cur_type = resolve_base_ident_type(doc, line, col, ident, is_call, type_args, &cur_mod);
         } else if (cur_mod) {
             Symbol sym = {0};
             char *target_uri = NULL;
@@ -2063,7 +2322,7 @@ static char *resolve_expr_type(const Document *doc, long long line, long long co
                     sb_append(&qt, sym.name);
                     cur_type = qt.data;
                 } else {
-                    cur_type = type_from_symbol_detail(doc, line, col, &sym, is_call);
+                    cur_type = type_from_symbol_detail(doc, line, col, &sym, is_call, type_args);
                 }
                 free(target_uri);
                 free(sym.name);
@@ -2076,6 +2335,7 @@ static char *resolve_expr_type(const Document *doc, long long line, long long co
             free(cur_type);
             cur_type = next_type;
         }
+        free(type_args);
         free(ident);
 
         while (*p == '[') {
@@ -2111,7 +2371,7 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
     if (!lp || qend == 0) return NULL;
     size_t pos = qend;
     while (pos > 0) {
-        if (lp[pos - 1] == ']' || lp[pos - 1] == ')') {
+        while (pos > 0 && (lp[pos - 1] == ']' || lp[pos - 1] == ')')) {
             char close_ch = lp[pos - 1];
             char open_ch = (close_ch == ']') ? '[' : '(';
             int depth = 1;
@@ -2122,6 +2382,9 @@ static char *extract_receiver_expr(const char *lp, size_t qend)
                 else if (lp[pos] == open_ch) depth--;
             }
             if (depth != 0) return NULL;
+            if (close_ch == ']' && pos > 0 && lp[pos - 1] == '.') {
+                pos--;
+            }
         }
         size_t id_end = pos;
         while (pos > 0 && is_ident_char((unsigned char)lp[pos - 1])) {
@@ -2156,7 +2419,7 @@ static void handle_completion(const char *id_raw, const char *params)
         "true", "false",
     };
     static const char *const types[] = {
-        "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool",
+        "int", "i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "bool",
     };
     static const char *const builtins[] = {"len", "data", "size_of"};
 
