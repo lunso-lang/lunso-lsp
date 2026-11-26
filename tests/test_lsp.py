@@ -379,6 +379,27 @@ class TestLunsoLsp(unittest.TestCase):
             sub_def = read_msg(proc.stdout)["result"]
             self.assertEqual(sub_def["uri"], (workdir / "support" / "math.lunso").as_uri())
 
+            # 8b. Go to definition on `import support.math` and selective `{ add_two }`
+            send({
+                "jsonrpc": "2.0",
+                "id": 80,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 0, "character": 16}},
+            })
+            def_mod = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_mod["uri"], (workdir / "support" / "math.lunso").as_uri())
+            self.assertEqual(def_mod["range"]["start"]["line"], 0)
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 81,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 0, "character": 23}},
+            })
+            def_sel = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_sel["uri"], (workdir / "support" / "math.lunso").as_uri())
+            self.assertEqual(def_sel["range"]["start"]["line"], 1)
+
             send({"jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": None})
             self.assertIsNone(read_msg(proc.stdout)["result"])
             send({"jsonrpc": "2.0", "method": "exit", "params": None})

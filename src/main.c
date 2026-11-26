@@ -1554,6 +1554,126 @@ static void handle_document_symbol(const char *id_raw, const char *params)
     free(uri);
 }
 
+static bool resolve_import_target_at(const Document *doc, long long target_line, long long target_col,
+                                     char **out_uri, Symbol *out_sym)
+{
+    *out_uri = NULL;
+    memset(out_sym, 0, sizeof(*out_sym));
+    size_t line_len = 0;
+    const char *lp = line_at(doc, target_line, &line_len);
+    if (!lp || target_col < 0 || (size_t)target_col >= line_len) {
+        return false;
+    }
+
+    const char *p = lp;
+    const char *end = lp + line_len;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+    if ((size_t)(end - p) < 7 || strncmp(p, "import ", 7) != 0) {
+        return false;
+    }
+    p += 7;
+    while (p < end && (*p == ' ' || *p == '\t')) p++;
+
+    const char *mstart = p;
+    while (p < end && (is_ident_char((unsigned char)*p) || *p == '.' || *p == '*')) p++;
+    const char *mend = p;
+    if (mend == mstart) {
+        return false;
+    }
+
+    size_t mlen = (size_t)(mend - mstart);
+    if (mlen >= 2 && mend[-2] == '.' && mend[-1] == '*') {
+        mlen -= 2;
+    } else if (mlen >= 1 && mend[-1] == '.') {
+        mlen -= 1;
+    }
+    if (mlen == 0) {
+        return false;
+    }
+    char *mod_path = malloc(mlen + 1);
+    memcpy(mod_path, mstart, mlen);
+    mod_path[mlen] = '\0';
+
+    const char *cursor_ptr = lp + (size_t)target_col;
+    const char *brace = memchr(mend, '{', (size_t)(end - mend));
+    if (brace && cursor_ptr > brace) {
+        const char *close_brace = memchr(brace, '}', (size_t)(end - brace));
+        if (!close_brace || cursor_ptr < close_brace) {
+            if (!is_ident_char((unsigned char)*cursor_ptr)) {
+                free(mod_path);
+                return false;
+            }
+            const char *wstart = cursor_ptr;
+            while (wstart > brace + 1 && is_ident_char((unsigned char)wstart[-1])) wstart--;
+            const char *wend = cursor_ptr + 1;
+            while (wend < end && is_ident_char((unsigned char)*wend)) wend++;
+
+            // Check if cursor is on the alias in `Orig as Alias`.
+            const char *lookup_start = wstart;
+            const char *lookup_end = wend;
+            const char *back = wstart;
+            while (back > brace + 1 && (back[-1] == ' ' || back[-1] == '\t')) back--;
+            if (back - (brace + 1) >= 3 && strncmp(back - 2, "as", 2) == 0 &&
+                (back - 2 == brace + 1 || !is_ident_char((unsigned char)back[-3]))) {
+                const char *orig_end = back - 2;
+                while (orig_end > brace + 1 && (orig_end[-1] == ' ' || orig_end[-1] == '\t')) orig_end--;
+                const char *orig_start = orig_end;
+                while (orig_start > brace + 1 && is_ident_char((unsigned char)orig_start[-1])) orig_start--;
+                if (orig_end > orig_start) {
+                    lookup_start = orig_start;
+                    lookup_end = orig_end;
+                }
+            }
+
+            char *item_name = malloc((size_t)(lookup_end - lookup_start) + 1);
+            memcpy(item_name, lookup_start, (size_t)(lookup_end - lookup_start));
+            item_name[lookup_end - lookup_start] = '\0';
+
+            char *mod_uri = NULL;
+            Symbol *mod_syms = NULL;
+            size_t mod_count = 0;
+            bool ok = false;
+            if (load_module_symbols(doc->path, mod_path, &mod_uri, &mod_syms, &mod_count)) {
+                const Symbol *found = find_symbol_in(mod_syms, mod_count, item_name, true);
+                if (found) {
+                    *out_uri = mod_uri;
+                    *out_sym = *found;
+                    out_sym->name = strdup(found->name);
+                    out_sym->detail = strdup(found->detail);
+                    ok = true;
+                } else {
+                    free(mod_uri);
+                }
+                free_symbol_list(mod_syms, mod_count);
+            }
+            free(item_name);
+            free(mod_path);
+            return ok;
+        }
+    }
+
+    if (cursor_ptr >= mstart && cursor_ptr <= end) {
+        char *file_path = resolve_module_file(doc->path, mod_path);
+        if (file_path) {
+            *out_uri = path_to_uri(file_path);
+            out_sym->name = strdup(mod_path);
+            StrBuf det;
+            sb_init(&det);
+            sb_append(&det, "// module ");
+            sb_append(&det, mod_path);
+            sb_append(&det, " -> ");
+            sb_append(&det, file_path);
+            out_sym->detail = det.data;
+            free(file_path);
+            free(mod_path);
+            return *out_uri != NULL;
+        }
+    }
+
+    free(mod_path);
+    return false;
+}
+
 static void handle_hover(const char *id_raw, const char *params)
 {
     const char *td = json_find_field(params, "textDocument");
@@ -1569,20 +1689,17 @@ static void handle_hover(const char *id_raw, const char *params)
 
     char *word = NULL;
     char *qual = NULL;
-    if (!ident_and_qualifier_at(doc, line, col, &word, &qual)) {
-        send_response(id_raw, "null");
-        free(uri);
-        return;
-    }
-
     char *target_uri = NULL;
     Symbol sym = {0};
     const char *detail = NULL;
-    bool resolved = resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym);
-    if (resolved) {
+    if (resolve_import_target_at(doc, line, col, &target_uri, &sym)) {
         detail = sym.detail;
-    } else if (!qual) {
-        detail = builtin_doc(word);
+    } else if (ident_and_qualifier_at(doc, line, col, &word, &qual)) {
+        if (resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym)) {
+            detail = sym.detail;
+        } else if (!qual) {
+            detail = builtin_doc(word);
+        }
     }
 
     if (!detail) {
@@ -1628,8 +1745,11 @@ static void handle_definition(const char *id_raw, const char *params)
     char *qual = NULL;
     char *target_uri = NULL;
     Symbol sym = {0};
-    if (!ident_and_qualifier_at(doc, line, col, &word, &qual) ||
-        !resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym)) {
+    bool ok = resolve_import_target_at(doc, line, col, &target_uri, &sym);
+    if (!ok && ident_and_qualifier_at(doc, line, col, &word, &qual)) {
+        ok = resolve_symbol_target(doc, word, qual, line, col, &target_uri, &sym);
+    }
+    if (!ok) {
         send_response(id_raw, "null");
     } else {
         StrBuf sb;
