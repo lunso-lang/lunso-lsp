@@ -35,6 +35,7 @@ module.exports = grammar({
 
   conflicts: $ => [
     [$._expression, $.struct_literal],
+    [$.block, $.struct_literal],
   ],
 
   rules: {
@@ -130,6 +131,7 @@ module.exports = grammar({
     parameter: $ => seq(
       field('name', $.identifier),
       ':',
+      optional('...'),
       field('type', $._type),
     ),
 
@@ -176,6 +178,8 @@ module.exports = grammar({
 
     _type: $ => choice(
       $.primitive_type,
+      $.result_type,
+      $.function_type,
       $.pointer_type,
       $.array_type,
       $.slice_type,
@@ -188,7 +192,17 @@ module.exports = grammar({
       'int',
       'i8', 'i16', 'i32', 'i64',
       'u8', 'u16', 'u32', 'u64',
-      'f32', 'f64', 'bool',
+      'f32', 'f64', 'bool', 'any',
+    ),
+
+    result_type: $ => seq('!', $._type),
+
+    function_type: $ => seq(
+      'fun',
+      '(',
+      optional(seq($._type, repeat(seq(',', $._type)), optional(','))),
+      ')',
+      optional(seq(':', $._type)),
     ),
 
     pointer_type: $ => seq('*', optional('const'), $._type),
@@ -260,6 +274,13 @@ module.exports = grammar({
       optional(choice(
         field('condition', $._expression),
         seq(
+          $.identifier,
+          optional(seq(',', $.identifier)),
+          'in',
+          $._expression,
+          optional(seq('..', $._expression)),
+        ),
+        seq(
           optional(choice($.var_statement, $._expression)),
           ';',
           optional($._expression),
@@ -277,6 +298,8 @@ module.exports = grammar({
       $.assignment_expression,
       $.binary_expression,
       $.unary_expression,
+      $.or_expression,
+      $.try_expression,
       $.cast_expression,
       $.call_expression,
       $.generic_expression,
@@ -295,6 +318,14 @@ module.exports = grammar({
     ),
 
     parenthesized_expression: $ => seq('(', $._expression, ')'),
+
+    try_expression: $ => prec(14, seq($._expression, '?')),
+
+    or_expression: $ => prec.right(1, seq(
+      $._expression,
+      'or',
+      choice(prec(2, $.block), prec(2, seq($.identifier, $.block)), $._expression),
+    )),
 
     assignment_expression: $ => prec.right(PREC.ASSIGN, seq(
       field('left', $._expression),

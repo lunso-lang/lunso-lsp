@@ -387,6 +387,27 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
         var n = fmt.u64_to_buf(t.length as u64, &nbuf[0], 32)
         return str.concat3(arena, "[", nbuf[0..n], str.concat(arena, "]", format_type(arena, sem, et, tree)))
     }
+    if t.kind == sema.TypeKind.Any { return "any" }
+    if t.kind == sema.TypeKind.Result {
+        var it = sem.elements.data[t.element_type as i64]
+        return str.concat(arena, "!", format_type(arena, sem, it, tree))
+    }
+    if t.kind == sema.TypeKind.Func && (t.record as u64) < sem.func_types.len {
+        var ft = &sem.func_types.data[t.record as i64]
+        var buf: vec.Vec[u8]
+        buf.init(arena, 64)
+        buf.append_slice("fun(")
+        for var i: u64 = 0; i < ft.params.len; i += 1 {
+            if i > 0 { buf.append_slice(", ") }
+            buf.append_slice(format_type(arena, sem, ft.params.data[i as i64], tree))
+        }
+        buf.append_slice(")")
+        if ft.result.kind != sema.TypeKind.Void {
+            buf.append_slice(": ")
+            buf.append_slice(format_type(arena, sem, ft.result, tree))
+        }
+        return buf.as_slice()
+    }
     return "unknown"
 }
 
@@ -579,6 +600,31 @@ fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
                     var vname = span_text(tree, ast.Span { offset: nd.pos, length: v.name_length })
                     out_names.push_value(vname)
                     out_offsets.push_value(nd.pos)
+                    out_nodes.push_value(nid)
+                }
+            }
+        } else if nd.kind == ast.AstKind.ForIn {
+            var h = tree.for_in_headers.data[nd.a as i64]
+            var bopen = nodes[nd.b as i64].pos
+            var bend = block_end_offset(tree.source, bopen)
+            if cursor_off >= bopen && cursor_off <= bend {
+                if h.index_name.length > 0 {
+                    out_names.push_value(span_text(tree, h.index_name))
+                    out_offsets.push_value(h.index_name.offset)
+                    out_nodes.push_value(nid)
+                }
+                out_names.push_value(span_text(tree, h.item_name))
+                out_offsets.push_value(h.item_name.offset)
+                out_nodes.push_value(nid)
+            }
+        } else if nd.kind == ast.AstKind.OrElse {
+            var h = tree.or_elses.data[nd.a as i64]
+            if h.is_block && h.err_name.length > 0 {
+                var bopen = nodes[h.handler as i64].pos
+                var bend = block_end_offset(tree.source, bopen)
+                if cursor_off >= bopen && cursor_off <= bend {
+                    out_names.push_value(span_text(tree, h.err_name))
+                    out_offsets.push_value(h.err_name.offset)
                     out_nodes.push_value(nid)
                 }
             }
@@ -1243,12 +1289,12 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         })
     }
 
-    var kws: [20][]u8 = [
+    var kws: [23][]u8 = [
         "fun", "ext", "struct", "enum", "as", "const", "import", "pub", "priv",
         "return", "if", "else", "match", "for", "break", "continue", "defer", "var",
-        "true", "false"
+        "or", "any", "Self", "true", "false"
     ]
-    for var i: i64 = 0; i < 20; i += 1 {
+    for var i: i64 = 0; i < 23; i += 1 {
         push_completion(out_items, typed_prefix, CompletionItem { label: kws[i], kind: 14, detail: "keyword" })
     }
     return true

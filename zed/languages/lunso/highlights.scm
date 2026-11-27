@@ -16,6 +16,7 @@
   "break"
   "continue"
   "defer"
+  "or"
 ] @keyword
 
 (visibility) @keyword.modifier

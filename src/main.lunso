@@ -132,7 +132,7 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
 
     json.object_val(arena, &info)
     json.set(arena, &info, "name", json.str_val("lunso-lsp"))
-    json.set(arena, &info, "version", json.str_val("0.3.2"))
+    json.set(arena, &info, "version", json.str_val("0.4.0"))
 
     json.object_val(arena, &res)
     json.set(arena, &res, "capabilities", caps)
