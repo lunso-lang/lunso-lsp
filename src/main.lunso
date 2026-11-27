@@ -114,8 +114,13 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     json.push(&sig_trig, json.str_val("("))
     json.push(&sig_trig, json.str_val("{"))
     json.push(&sig_trig, json.str_val(","))
+    var sig_retrig: json.JsonValue
+    json.array_val(arena, &sig_retrig)
+    json.push(&sig_retrig, json.str_val(","))
+    json.push(&sig_retrig, json.str_val(" "))
     json.object_val(arena, &sig_help)
     json.set(arena, &sig_help, "triggerCharacters", sig_trig)
+    json.set(arena, &sig_help, "retriggerCharacters", sig_retrig)
 
     json.object_val(arena, &caps)
     json.set(arena, &caps, "textDocumentSync", sync)
