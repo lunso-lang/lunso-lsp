@@ -326,6 +326,19 @@ class TestLunsoLsp(unittest.TestCase):
             comp_main = {item["label"] for item in read_msg(proc.stdout)["result"]}
             self.assertIn("local_val", comp_main)
             self.assertNotIn("idx", comp_main)
+            self.assertIn("defer", comp_main)
+            self.assertIn("return", comp_main)
+
+            # signatureHelp on math.add_two(x) at line 20 char 24
+            send({
+                "jsonrpc": "2.0",
+                "id": 76,
+                "method": "textDocument/signatureHelp",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 24}},
+            })
+            sig_resp = read_msg(proc.stdout)["result"]
+            self.assertIn("pub fun add_two(v: i32): i32", sig_resp["signatures"][0]["label"])
+            self.assertEqual(sig_resp["activeParameter"], 0)
 
             # 7. Diagnostics on valid single-file change
             send({
