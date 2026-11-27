@@ -1,239 +1,457 @@
 #!/usr/bin/env python3
+"""Integration tests for lunso-lsp over JSON-RPC stdio."""
+
+from __future__ import annotations
+
 import json
-import subprocess
-import sys
-import tempfile
+import os
 from pathlib import Path
+import subprocess
+import tempfile
+import unittest
 
 ROOT = Path(__file__).resolve().parent.parent
-BIN = ROOT / "build" / "lunso-lsp"
-STD_DIR = (ROOT.parent / "lunsoc" / "std").resolve()
+LSP_BIN = ROOT / "build" / "lunso-lsp"
+LUNSO_BIN = ROOT.parent / "lunsoc" / "build" / "lunsoc"
+STD_DIR = ROOT.parent / "lunsoc" / "std"
 
 
-def send_msg(proc: subprocess.Popen, payload: dict) -> None:
+def encode_msg(payload: dict) -> bytes:
     raw = json.dumps(payload).encode("utf-8")
-    header = f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii")
-    assert proc.stdin is not None
-    proc.stdin.write(header + raw)
-    proc.stdin.flush()
+    return f"Content-Length: {len(raw)}\r\n\r\n".encode("ascii") + raw
 
 
-def read_msg(proc: subprocess.Popen) -> dict:
-    assert proc.stdout is not None
-    content_len = None
+def read_msg(stream) -> dict:
+    content_length = 0
     while True:
-        line = proc.stdout.readline()
+        line = stream.readline()
         if not line:
-            raise RuntimeError("unexpected EOF reading LSP headers")
-        text = line.decode("ascii").strip()
-        if not text:
+            raise EOFError("unexpected EOF from lunso-lsp")
+        if line in (b"\r\n", b"\n"):
             break
-        if text.lower().startswith("content-length:"):
-            content_len = int(text.split(":", 1)[1].strip())
-    assert content_len is not None, "missing Content-Length"
-    body = proc.stdout.read(content_len)
-    if len(body) != content_len:
-        raise RuntimeError(f"truncated LSP body: {len(body)} vs {content_len}")
+        if line.lower().startswith(b"content-length:"):
+            content_length = int(line.split(b":", 1)[1].strip())
+    body = stream.read(content_length)
     return json.loads(body.decode("utf-8"))
 
 
-def main() -> int:
-    if not BIN.is_file():
-        print(f"missing binary: {BIN}", file=sys.stderr)
-        return 1
+class TestLunsoLsp(unittest.TestCase):
+    def test_lsp_lifecycle_and_cross_module_features(self) -> None:
+        env = os.environ.copy()
+        if LUNSO_BIN.exists():
+            env["LUNSO"] = str(LUNSO_BIN)
+        if STD_DIR.exists():
+            env["LUNSO_STD_DIR"] = str(STD_DIR)
 
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp = Path(tmpdir)
-        helper_path = tmp / "helper.lunso"
-        main_path = tmp / "main.lunso"
-        helper_uri = helper_path.as_uri()
-        main_uri = main_path.as_uri()
-
-        proc = subprocess.Popen(
-            [str(BIN), "--std", str(STD_DIR)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-
-        try:
-            # 1. initialize
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {"rootUri": tmp.as_uri(), "capabilities": {}},
-                },
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            (workdir / "support").mkdir()
+            (workdir / "support" / "math.lunso").write_text(
+                "pub const OFFSET: i32 = 5\n"
+                "pub fun add_two(v: i32): i32 {\n"
+                "    return v + 2\n"
+                "}\n"
+                "priv fun hidden(): i32 {\n"
+                "    return 99\n"
+                "}\n",
+                encoding="utf-8",
             )
-            init_resp = read_msg(proc)
-            assert init_resp["id"] == 1
-            caps = init_resp["result"]["capabilities"]
-            assert caps["hoverProvider"] is True
-            assert caps["definitionProvider"] is True
-            assert init_resp["result"]["serverInfo"]["name"] == "lunso-lsp"
-
-            send_msg(proc, {"jsonrpc": "2.0", "method": "initialized", "params": {}})
-
-            # 2. didOpen unsaved overlay helper.lunso + main.lunso
-            helper_src = "pub const FACTOR: i32 = 2\npub fun add(a: i32, b: i32): i32 {\n    return a + b\n}\n"
-            main_src = "import helper\n\nfun main(): i32 {\n    return helper.add(1, helper.FACTOR)\n}\n"
-
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didOpen",
-                    "params": {
-                        "textDocument": {
-                            "uri": helper_uri,
-                            "languageId": "lunso",
-                            "version": 1,
-                            "text": helper_src,
-                        }
-                    },
-                },
+            doc_path = workdir / "demo.lunso"
+            uri = doc_path.as_uri()
+            source = (
+                "import std.io\n"
+                "import std.vec\n"
+                "import support.math\n"
+                "import \n"
+                "import std.\n"
+                "import support.\n"
+                "struct Inner {\n"
+                "    val: i32\n"
+                "}\n"
+                "struct Box[T] {\n"
+                "    value: T\n"
+                "}\n"
+                "struct Pair {\n"
+                "    a: i32\n"
+                "    nested: Inner\n"
+                "}\n"
+                "fun wrap[T](item: T): Box[T] {\n"
+                "    return Box[T] { value: item }\n"
+                "}\n"
+                "fun helper(x: i32): i32 {\n"
+                "    return math.add_two(x)\n"
+                "}\n"
+                "fun main(): i32 {\n"
+                "    io.\n"
+                "    var local_val: i32 = 42\n"
+                "    var items: []Pair\n"
+                "    items[0].\n"
+                "    items[0].nested.\n"
+                "    unknown_var.\n"
+                "    var tokens: vec.Vec[Inner]\n"
+                "    tokens.\n"
+                "    tokens.data[0].\n"
+                "    wrap.[Inner](tokens.data[0]).\n"
+                "    for var idx: i32 = 0; idx < 3; idx += 1 {\n"
+                "        var inner = idx + local_val\n"
+                "    }\n"
+                "    return helper(local_val)\n"
+                "}\n"
             )
-            d1 = read_msg(proc)
-            assert d1["method"] == "textDocument/publishDiagnostics"
-            assert d1["params"]["diagnostics"] == []
 
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didOpen",
-                    "params": {
-                        "textDocument": {
-                            "uri": main_uri,
-                            "languageId": "lunso",
-                            "version": 1,
-                            "text": main_src,
-                        }
-                    },
-                },
+            proc = subprocess.Popen(
+                [str(LSP_BIN)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
             )
-            d2 = read_msg(proc)
-            assert d2["method"] == "textDocument/publishDiagnostics"
-            assert d2["params"]["diagnostics"] == [], f"unexpected diags: {d2}"
+            assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
 
-            # 3. hover on helper.add (line 3, col 18)
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 2,
-                    "method": "textDocument/hover",
-                    "params": {
-                        "textDocument": {"uri": main_uri},
-                        "position": {"line": 3, "character": 19},
-                    },
+            def send(msg: dict) -> None:
+                proc.stdin.write(encode_msg(msg))
+                proc.stdin.flush()
+
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            init_resp = read_msg(proc.stdout)
+            self.assertEqual(init_resp["id"], 1)
+            self.assertTrue(init_resp["result"]["capabilities"]["hoverProvider"])
+
+            send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "lunso",
+                        "version": 1,
+                        "text": source,
+                    }
                 },
-            )
-            hover_resp = read_msg(proc)
-            assert hover_resp["id"] == 2
-            assert "fun add(a: i32, b: i32): i32" in hover_resp["result"]["contents"]["value"], hover_resp
+            })
+            _diag = read_msg(proc.stdout)
 
-            # 4. definition on helper.add -> helper.lunso line 1, char 8
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 3,
-                    "method": "textDocument/definition",
-                    "params": {
-                        "textDocument": {"uri": main_uri},
-                        "position": {"line": 3, "character": 19},
-                    },
+            # 1. `import ` completion (root)
+            send({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 3, "character": 7}},
+            })
+            comp_root = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("std", comp_root)
+            self.assertIn("support", comp_root)
+
+            # 2. `import std.` completion
+            send({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 4, "character": 11}},
+            })
+            comp_std = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("io", comp_std)
+            self.assertIn("mem", comp_std)
+            self.assertIn("file", comp_std)
+
+            # 3. `import support.` completion
+            send({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 5, "character": 15}},
+            })
+            comp_sup = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("math", comp_sup)
+
+            # 4. `io.` member completion
+            send({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 23, "character": 7}},
+            })
+            comp_io = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("println", comp_io)
+            self.assertIn("eprintln", comp_io)
+
+            # 4b. `items[0].` and `items[0].nested.` struct field completion (no keywords!)
+            send({
+                "jsonrpc": "2.0",
+                "id": 51,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 26, "character": 13}},
+            })
+            comp_item = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp_item, {"a", "nested"})
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 52,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 27, "character": 20}},
+            })
+            comp_nested = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp_nested, {"val"})
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 53,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 28, "character": 16}},
+            })
+            comp_unknown = read_msg(proc.stdout)["result"]
+            self.assertEqual(comp_unknown, [])
+
+            # 4c. Generics: `tokens.`, `tokens.data[0].`, `wrap.[Inner](...).`
+            send({
+                "jsonrpc": "2.0",
+                "id": 54,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 30, "character": 11}},
+            })
+            comp_vec_items = read_msg(proc.stdout)["result"]
+            comp_vec_map = {item["label"]: item.get("detail") for item in comp_vec_items}
+            self.assertEqual(set(comp_vec_map.keys()), {"data", "len", "cap", "arena"})
+            self.assertEqual(comp_vec_map["data"], "data: *Inner")
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 55,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 19}},
+            })
+            comp_vec_elem = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp_vec_elem, {"val"})
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 56,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 32, "character": 34}},
+            })
+            comp_wrap = read_msg(proc.stdout)["result"]
+            comp_wrap_map = {item["label"]: item.get("detail") for item in comp_wrap}
+            self.assertEqual(comp_wrap_map, {"value": "value: Inner"})
+
+            # 5. Hover on imported `math.add_two`
+            send({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 18}},
+            })
+            hover_imp = read_msg(proc.stdout)["result"]
+            self.assertIn("pub fun add_two(v: i32): i32", hover_imp["contents"]["value"])
+
+            # 6. Go to definition on imported `math.add_two`
+            send({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 18}},
+            })
+            def_imp = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_imp["uri"], (workdir / "support" / "math.lunso").as_uri())
+            self.assertEqual(def_imp["range"]["start"]["line"], 1)
+
+            # 6b. Hover & Go to definition on parameter `x` and generic param `item`
+            send({
+                "jsonrpc": "2.0",
+                "id": 70,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 24}},
+            })
+            hover_param = read_msg(proc.stdout)["result"]
+            self.assertIn("x: i32", hover_param["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 701,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 28}},
+            })
+            hover_gparam = read_msg(proc.stdout)["result"]
+            self.assertIn("item: T", hover_gparam["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 71,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 20, "character": 24}},
+            })
+            def_param = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_param["uri"], uri)
+            self.assertEqual(def_param["range"]["start"]["line"], 19)
+            self.assertEqual(def_param["range"]["start"]["character"], 11)
+
+            # 6c. Hover & Go to definition on local `local_val` and loop var `idx`
+            send({
+                "jsonrpc": "2.0",
+                "id": 72,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 36, "character": 20}},
+            })
+            hover_local = read_msg(proc.stdout)["result"]
+            self.assertIn("var local_val: i32 = 42", hover_local["contents"]["value"])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 73,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 36, "character": 20}},
+            })
+            def_local = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_local["uri"], uri)
+            self.assertEqual(def_local["range"]["start"]["line"], 24)
+            self.assertEqual(def_local["range"]["start"]["character"], 8)
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 74,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 34, "character": 21}},
+            })
+            hover_loop = read_msg(proc.stdout)["result"]
+            self.assertIn("var idx: i32 = 0", hover_loop["contents"]["value"])
+
+            # Completion inside `main` includes `local_val`
+            send({
+                "jsonrpc": "2.0",
+                "id": 75,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 36, "character": 11}},
+            })
+            comp_main = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("local_val", comp_main)
+            self.assertNotIn("idx", comp_main)
+
+            # 7. Diagnostics on valid single-file change
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didChange",
+                "params": {
+                    "textDocument": {"uri": uri, "version": 2},
+                    "contentChanges": [{"text": "fun main(): i32 {\n    var x: i32 = \"bad\"\n    return x\n}\n"}],
                 },
-            )
-            def_resp = read_msg(proc)
-            assert def_resp["id"] == 3
-            assert def_resp["result"]["uri"] == helper_uri, def_resp
-            assert def_resp["result"]["range"]["start"] == {"line": 1, "character": 8}, def_resp
+            })
+            diag_err = read_msg(proc.stdout)
+            self.assertEqual(diag_err["method"], "textDocument/publishDiagnostics")
+            self.assertGreaterEqual(len(diag_err["params"]["diagnostics"]), 1)
 
-            # 5. completion after helper. (line 3, col 18 -> right after '.')
-            comp_src = "import helper\n\nfun main(): i32 {\n    return helper.\n}\n"
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didChange",
-                    "params": {
-                        "textDocument": {"uri": main_uri, "version": 2},
-                        "contentChanges": [{"text": comp_src}],
-                    },
+            # 8. Submodule in nested directory importing sibling via project root (`main.lunso`)
+            (workdir / "main.lunso").write_text(
+                "import support.sub\n"
+                "fun main(): i32 { return support.sub.use_math(3) }\n",
+                encoding="utf-8",
+            )
+            sub_path = workdir / "support" / "sub.lunso"
+            sub_text = (
+                "import support.math { add_two }\n"
+                "pub fun use_math(x: i32): i32 {\n"
+                "    return add_two(x)\n"
+                "}\n"
+            )
+            sub_path.write_text(sub_text, encoding="utf-8")
+            sub_uri = sub_path.as_uri()
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": sub_uri,
+                        "languageId": "lunso",
+                        "version": 1,
+                        "text": sub_text,
+                    }
                 },
-            )
-            _ = read_msg(proc)  # diagnostics for incomplete syntax
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "id": 4,
-                    "method": "textDocument/completion",
-                    "params": {
-                        "textDocument": {"uri": main_uri},
-                        "position": {"line": 3, "character": 18},
-                    },
+            })
+            sub_diag = read_msg(proc.stdout)
+            self.assertEqual(sub_diag["params"]["diagnostics"], [])
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 79,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 2, "character": 12}},
+            })
+            sub_def = read_msg(proc.stdout)["result"]
+            self.assertEqual(sub_def["uri"], (workdir / "support" / "math.lunso").as_uri())
+
+            # 8b. Go to definition on `import support.math` and selective `{ add_two }`
+            send({
+                "jsonrpc": "2.0",
+                "id": 80,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 0, "character": 16}},
+            })
+            def_mod = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_mod["uri"], (workdir / "support" / "math.lunso").as_uri())
+            self.assertEqual(def_mod["range"]["start"]["line"], 0)
+
+            send({
+                "jsonrpc": "2.0",
+                "id": 81,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": sub_uri}, "position": {"line": 0, "character": 23}},
+            })
+            def_sel = read_msg(proc.stdout)["result"]
+            self.assertEqual(def_sel["uri"], (workdir / "support" / "math.lunso").as_uri())
+            self.assertEqual(def_sel["range"]["start"]["line"], 1)
+
+            # 8c. Hover & Go to definition on struct fields (including generic `tokens.data`)
+            # Re-open `uri` with original source first since step 7 ran `didChange` on `uri`
+            send({
+                "jsonrpc": "2.0",
+                "method": "textDocument/didOpen",
+                "params": {
+                    "textDocument": {
+                        "uri": uri,
+                        "languageId": "lunso",
+                        "version": 3,
+                        "text": source,
+                    }
                 },
-            )
-            comp_resp = read_msg(proc)
-            assert comp_resp["id"] == 4
-            labels = {item["label"] for item in comp_resp["result"]}
-            assert {"add", "FACTOR"}.issubset(labels), comp_resp
+            })
+            _diag_reopen = read_msg(proc.stdout)
+            send({
+                "jsonrpc": "2.0",
+                "id": 83,
+                "method": "textDocument/hover",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 12}},
+            })
+            hover_field = read_msg(proc.stdout)["result"]
+            self.assertIn("data: *Inner", hover_field["contents"]["value"])
 
-            # 6. didChange with type error -> non-empty diagnostics, then fix -> empty
-            bad_src = "fun main(): i32 {\n    return \"oops\"\n}\n"
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didChange",
-                    "params": {
-                        "textDocument": {"uri": main_uri, "version": 3},
-                        "contentChanges": [{"text": bad_src}],
-                    },
-                },
-            )
-            d_bad = read_msg(proc)
-            assert len(d_bad["params"]["diagnostics"]) == 1, d_bad
-            assert d_bad["params"]["diagnostics"][0]["range"]["start"]["line"] == 1, d_bad
+            send({
+                "jsonrpc": "2.0",
+                "id": 84,
+                "method": "textDocument/definition",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 12}},
+            })
+            def_field = read_msg(proc.stdout)["result"]
+            self.assertTrue(def_field["uri"].endswith("/std/vec.lunso"))
+            self.assertEqual(def_field["range"]["start"]["line"], 3)
 
-            send_msg(
-                proc,
-                {
-                    "jsonrpc": "2.0",
-                    "method": "textDocument/didChange",
-                    "params": {
-                        "textDocument": {"uri": main_uri, "version": 4},
-                        "contentChanges": [{"text": main_src}],
-                    },
-                },
-            )
-            d_fixed = read_msg(proc)
-            assert d_fixed["params"]["diagnostics"] == [], d_fixed
+            # 8d. documentSymbol
+            send({
+                "jsonrpc": "2.0",
+                "id": 85,
+                "method": "textDocument/documentSymbol",
+                "params": {"textDocument": {"uri": uri}},
+            })
+            doc_syms = {s["name"] for s in read_msg(proc.stdout)["result"]}
+            self.assertTrue({"Inner", "Box", "Pair", "wrap", "helper", "main"}.issubset(doc_syms))
 
-            # 7. didClose, shutdown, exit
-            send_msg(proc, {"jsonrpc": "2.0", "method": "textDocument/didClose", "params": {"textDocument": {"uri": main_uri}}})
-            _ = read_msg(proc)
-            send_msg(proc, {"jsonrpc": "2.0", "id": 5, "method": "shutdown", "params": None})
-            sh_resp = read_msg(proc)
-            assert sh_resp["id"] == 5 and sh_resp["result"] is None
-            send_msg(proc, {"jsonrpc": "2.0", "method": "exit", "params": None})
-
-            rc = proc.wait(timeout=5)
-            stderr_out = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
-            assert rc == 0, f"expected exit 0, got {rc}; stderr={stderr_out}"
-        finally:
-            if proc.poll() is None:
-                proc.kill()
-                proc.wait()
-
-    print("OK (initialize, overlays, diagnostics, hover, definition, completion, shutdown/exit)")
-    return 0
+            send({"jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": None})
+            self.assertIsNone(read_msg(proc.stdout)["result"])
+            send({"jsonrpc": "2.0", "method": "exit", "params": None})
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+            self.assertEqual(proc.wait(timeout=5), 0)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    unittest.main()

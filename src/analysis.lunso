@@ -1,11 +1,14 @@
+import std.file
 import std.fmt
 import std.map
 import std.mem
+import std.os
 import std.path
 import std.str
 import std.vec
 import frontend.ast
 import frontend.modules
+import frontend.parser
 import frontend.sema
 
 pub struct Document {
@@ -35,6 +38,14 @@ pub struct CompletionItem {
     label: []u8
     kind: i64
     detail: []u8
+}
+
+pub struct DocSymbol {
+    name: []u8
+    kind: i64
+    line: u64
+    col: u64
+    end_col: u64
 }
 
 pub fun workspace_init(ws: *Workspace, std_dir: []u8): bool {
@@ -121,6 +132,19 @@ fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *map.StrMap[[]u8]): b
     return true
 }
 
+fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out: *vec.Vec[[]u8]) {
+    vec.init.[[]u8](out, arena, 8)
+    if len(ws.root_path) > 0 {
+        vec.push_value.[[]u8](out, ws.root_path)
+    }
+    var cur = path.dir_prefix(doc_path)
+    for var depth: i32 = 0; depth < 4 && len(cur) > 1; depth += 1 {
+        vec.push_value.[[]u8](out, cur)
+        var trimmed = cur[0..(len(cur) - 1)]
+        cur = path.dir_prefix(trimmed)
+    }
+}
+
 fun offset_to_lsp(arena: *mem.Arena, prog: *modules.ModuleProgram, doc: *Document,
                   global_off: u32, out_uri: *[]u8, out_line: *u64, out_col: *u64) {
     var files = vec.as_slice.[modules.ModuleFile](&prog.files)
@@ -145,21 +169,21 @@ fun offset_to_lsp(arena: *mem.Arena, prog: *modules.ModuleProgram, doc: *Documen
     *out_col = 0
 }
 
-fun run_frontend(arena: *mem.Arena, ws: *Workspace, doc: *Document,
-                 prog: *modules.ModuleProgram, sem: *sema.Sema,
-                 out_diag: *Diagnostic, has_diag: *bool): bool {
+fun run_frontend_text(arena: *mem.Arena, ws: *Workspace, doc: *Document, src_text: []u8,
+                      prog: *modules.ModuleProgram, sem: *sema.Sema,
+                      out_diag: *Diagnostic, has_diag: *bool): bool {
     *has_diag = false
     var overlays: map.StrMap[[]u8]
     if !build_overlays(arena, ws, &overlays) {
         return false
     }
+    map.set.[[]u8](&overlays, doc.path, src_text)
+
     var inc_dirs: vec.Vec[[]u8]
-    vec.init.[[]u8](&inc_dirs, arena, 2)
-    if len(ws.root_path) > 0 {
-        vec.push_value.[[]u8](&inc_dirs, ws.root_path)
-    }
+    collect_include_dirs(arena, ws, doc.path, &inc_dirs)
+
     prog.quiet = true
-    if !modules.load_with_overlays(arena, doc.path, doc.text, ws.std_dir,
+    if !modules.load_with_overlays(arena, doc.path, src_text, ws.std_dir,
                                    vec.as_slice.[[]u8](&inc_dirs), &overlays, prog) {
         if prog.has_error {
             var duri: []u8
@@ -188,7 +212,77 @@ pub fun analyze(arena: *mem.Arena, ws: *Workspace, doc: *Document,
                 out_diag: *Diagnostic, has_diag: *bool) {
     var prog: modules.ModuleProgram
     var sem: sema.Sema
-    run_frontend(arena, ws, doc, &prog, &sem, out_diag, has_diag)
+    run_frontend_text(arena, ws, doc, doc.text, &prog, &sem, out_diag, has_diag)
+}
+
+// Sanitizes incomplete `import ...` and trailing-dot lines while keeping byte offsets identical.
+fun sanitize_source(arena: *mem.Arena, src: []u8, cursor_off: u32, strip_cursor_dot: bool): []u8 {
+    var n = len(src)
+    if n == 0 { return "" }
+    var buf: *u8
+    if mem.alloc(arena, n as u64, 1, &buf) < 0 {
+        return src
+    }
+    for var i: i64 = 0; i < n; i += 1 {
+        buf[i] = src[i]
+    }
+    var line_start: i64 = 0
+    for line_start < n {
+        var line_end = line_start
+        for line_end < n && buf[line_end] != '\n' {
+            line_end += 1
+        }
+        var raw_end = line_end
+        if raw_end > line_start && buf[raw_end - 1] == '\r' {
+            raw_end -= 1
+        }
+        var trimmed = str.trim(buf[line_start..raw_end])
+        var is_cursor_line = (cursor_off as i64) >= line_start && (cursor_off as i64) <= line_end
+        var blank_line = false
+        if str.equals(trimmed, "import") {
+            blank_line = true
+        } else if str.starts_with(trimmed, "import ") && len(trimmed) > 0 && trimmed[len(trimmed) - 1] == '.' {
+            blank_line = true
+        } else if len(trimmed) > 0 && trimmed[len(trimmed) - 1] == '.' {
+            if is_cursor_line && strip_cursor_dot {
+                var dot_pos = raw_end - 1
+                for dot_pos >= line_start && buf[dot_pos] != '.' {
+                    dot_pos -= 1
+                }
+                if dot_pos >= line_start && buf[dot_pos] == '.' {
+                    buf[dot_pos] = ' '
+                }
+            } else {
+                blank_line = true
+            }
+        }
+        if blank_line {
+            for var k = line_start; k < raw_end; k += 1 {
+                buf[k] = ' '
+            }
+        }
+        line_start = line_end + 1
+    }
+    return buf[0..n]
+}
+
+fun run_best_effort(arena: *mem.Arena, ws: *Workspace, doc: *Document, cursor_off: u32,
+                    strip_cursor_dot: bool, prog: *modules.ModuleProgram, sem: *sema.Sema): bool {
+    var diag: Diagnostic
+    var has_diag = false
+    if !strip_cursor_dot && run_frontend_text(arena, ws, doc, doc.text, prog, sem, &diag, &has_diag) {
+        return true
+    }
+    var clean = sanitize_source(arena, doc.text, cursor_off, strip_cursor_dot)
+    var p2: modules.ModuleProgram
+    var s2: sema.Sema
+    var ok = run_frontend_text(arena, ws, doc, clean, &p2, &s2, &diag, &has_diag)
+    if p2.tree.modules.len > 0 || prog.tree.modules.len == 0 {
+        *prog = p2
+        *sem = s2
+        return ok
+    }
+    return false
 }
 
 fun is_ident_char(ch: u8): bool {
@@ -224,6 +318,10 @@ fun word_at(src: []u8, off: u32, out_word: *[]u8, out_prefix: *[]u8): bool {
         *out_prefix = src[pstart..(start - 1)]
     }
     return true
+}
+
+fun span_text(tree: *ast.Ast, sp: ast.Span): []u8 {
+    return tree.source[(sp.offset as i64)..((sp.offset + sp.length) as i64)]
 }
 
 fun find_binding(scope: *ast.AstModuleScope, name: []u8, out: *ast.AstBinding): bool {
@@ -269,7 +367,7 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
     if t.kind == sema.TypeKind.Struct {
         var sr = sem.records.data[t.record as i64]
         var sp = tree.structs.data[sr.declaration as i64].name
-        return tree.source[(sp.offset as i64)..((sp.offset + sp.length) as i64)]
+        return span_text(tree, sp)
     }
     if t.kind == sema.TypeKind.Pointer {
         var pt = sem.pointees.data[t.pointee as i64]
@@ -288,15 +386,32 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
     return "unknown"
 }
 
-fun span_text(tree: *ast.Ast, sp: ast.Span): []u8 {
-    return tree.source[(sp.offset as i64)..((sp.offset + sp.length) as i64)]
+fun line_slice_at(src: []u8, offset: u32): []u8 {
+    var n = len(src)
+    var pos = offset as i64
+    if pos > n { pos = n }
+    var start = pos
+    for start > 0 && src[start - 1] != '\n' {
+        start -= 1
+    }
+    var end = pos
+    for end < n && src[end] != '\n' && src[end] != '\r' {
+        end += 1
+    }
+    return str.trim(src[start..end])
 }
 
 fun format_fn_sig(arena: *mem.Arena, tree: *ast.Ast, sem: *sema.Sema, fn_idx: u32): []u8 {
     var fdecl = tree.functions.data[fn_idx as i64]
+    var sig_line = line_slice_at(tree.source, fdecl.name.offset)
+    var brace = str.index_of(sig_line, '{')
+    if brace >= 0 {
+        return str.trim(sig_line[0..brace])
+    }
     var sf = sem.functions.data[fn_idx as i64]
     var buf: vec.Vec[u8]
     vec.init.[u8](&buf, arena, 128)
+    if fdecl.public { vec.append_slice.[u8](&buf, "pub ") }
     vec.append_slice.[u8](&buf, "fun ")
     vec.append_slice.[u8](&buf, span_text(tree, fdecl.name))
     vec.push_value.[u8](&buf, '(')
@@ -353,7 +468,7 @@ fun find_module_decl(tree: *ast.Ast, mod_idx: u32, name: []u8, only_pub: bool, o
     return false
 }
 
-fun resolve_symbol_binding(prog: *modules.ModuleProgram, doc: *Document, word: []u8, prefix: []u8,
+fun resolve_symbol_binding(prog: *modules.ModuleProgram, word: []u8, prefix: []u8,
                            out_binding: *ast.AstBinding): bool {
     if prog.tree.modules.len == 0 {
         return false
@@ -372,14 +487,189 @@ fun resolve_symbol_binding(prog: *modules.ModuleProgram, doc: *Document, word: [
     return find_binding(main_scope, word, out_binding)
 }
 
-pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
-                   out_uri: *[]u8, out_line: *u64, out_col: *u64): bool {
-    var prog: modules.ModuleProgram
-    var sem: sema.Sema
-    var diag: Diagnostic
-    var has_diag = false
-    run_frontend(arena, ws, doc, &prog, &sem, &diag, &has_diag)
-    if prog.tree.modules.len == 0 {
+fun find_enclosing_fn(tree: *ast.Ast, off: u32): i64 {
+    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    for var i: i64 = 0; i < len(fns); i += 1 {
+        if fns[i].module != 0 || fns[i].body == ast.NODE_NONE {
+            continue
+        }
+        var fn_start = fns[i].name.offset
+        var body_node = nodes[fns[i].body as i64]
+        var fn_end = block_end_offset(tree.source, body_node.pos)
+        if off >= fn_start && off <= fn_end {
+            return i
+        }
+    }
+    return -1
+}
+
+fun block_end_offset(src: []u8, open_pos: u32): u32 {
+    var n = len(src)
+    var pos = open_pos as i64
+    var depth: i32 = 0
+    for pos < n {
+        if src[pos] == '{' {
+            depth += 1
+        } else if src[pos] == '}' {
+            depth -= 1
+            if depth <= 0 {
+                return pos as u32
+            }
+        }
+        pos += 1
+    }
+    return n as u32
+}
+
+fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
+                          out_names: *vec.Vec[[]u8], out_offsets: *vec.Vec[u32], out_nodes: *vec.Vec[u32]) {
+    var fdecl = tree.functions.data[fn_idx]
+    var children = vec.as_slice.[u32](&tree.children)
+    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    for var i: u32 = 0; i < fdecl.parameters.count; i += 1 {
+        var pid = children[(fdecl.parameters.first + i) as i64]
+        var pn = nodes[pid as i64]
+        var pname = span_text(tree, ast.Span { offset: pn.pos, length: pn.a })
+        vec.push_value.[[]u8](out_names, pname)
+        vec.push_value.[u32](out_offsets, pn.pos)
+        vec.push_value.[u32](out_nodes, pid)
+    }
+
+    // Walk AST nodes in the function; track block/loop end offsets so out-of-scope loop vars are excluded.
+    var vars = vec.as_slice.[ast.AstVariable](&tree.variables)
+    var active_ends: [64]u32
+    var active_depth: i32 = 0
+    var fn_first = fdecl.nodes.first
+    var fn_end = fn_first + fdecl.nodes.count
+    for var nid = fn_first; nid < fn_end; nid += 1 {
+        var nd = nodes[nid as i64]
+        if nd.kind == ast.AstKind.Block {
+            var bend = block_end_offset(tree.source, nd.pos)
+            if cursor_off >= nd.pos && cursor_off <= bend && active_depth < 64 {
+                active_ends[active_depth] = bend
+                active_depth += 1
+            }
+        } else if nd.kind == ast.AstKind.Var {
+            if nd.pos <= cursor_off {
+                // Check if var is inside a block/loop that already closed before cursor_off.
+                var scope_end: u32 = ~0 as u32
+                for var b = fn_first; b < fn_end; b += 1 {
+                    var bn = nodes[b as i64]
+                    if bn.kind == ast.AstKind.Block || bn.kind == ast.AstKind.For || bn.kind == ast.AstKind.ForCStyle {
+                        var bopen = bn.pos
+                        if bn.kind == ast.AstKind.For || bn.kind == ast.AstKind.ForCStyle {
+                            var body_id = bn.b
+                            if body_id != ast.NODE_NONE {
+                                bopen = nodes[body_id as i64].pos
+                            }
+                        }
+                        var bend = block_end_offset(tree.source, bopen)
+                        if nd.pos >= bn.pos && nd.pos <= bend && bend < scope_end {
+                            scope_end = bend
+                        }
+                    }
+                }
+                if cursor_off <= scope_end {
+                    var v = vars[nd.a as i64]
+                    var vname = span_text(tree, ast.Span { offset: nd.pos, length: v.name_length })
+                    vec.push_value.[[]u8](out_names, vname)
+                    vec.push_value.[u32](out_offsets, nd.pos)
+                    vec.push_value.[u32](out_nodes, nid)
+                }
+            }
+        }
+    }
+}
+
+fun find_local_at(tree: *ast.Ast, fn_idx: i64, cursor_off: u32, name: []u8,
+                  out_off: *u32, out_nid: *u32): bool {
+    var names: vec.Vec[[]u8]
+    var offsets: vec.Vec[u32]
+    var nids: vec.Vec[u32]
+    vec.init.[[]u8](&names, tree.nodes.arena, 16)
+    vec.init.[u32](&offsets, tree.nodes.arena, 16)
+    vec.init.[u32](&nids, tree.nodes.arena, 16)
+    collect_in_scope_locals(tree, fn_idx, cursor_off, &names, &offsets, &nids)
+    for var i = (names.len as i64) - 1; i >= 0; i -= 1 {
+        if str.equals(names.data[i], name) {
+            *out_off = offsets.data[i]
+            *out_nid = nids.data[i]
+            return true
+        }
+    }
+    return false
+}
+
+fun sema_node_at(sem: *sema.Sema, fn_idx: i64, fn_first: u32, nid: u32): *sema.SemaNode {
+    var sf = &sem.functions.data[fn_idx]
+    if sf.nodes.len > 0 {
+        return &sf.nodes.data[(nid - fn_first) as i64]
+    }
+    return &sem.nodes.data[nid as i64]
+}
+
+fun find_member_node_at(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i64,
+                        cursor_off: u32, word: []u8, out_struct_type: *sema.SemaType): bool {
+    if fn_idx < 0 || (fn_idx as u64) >= sem.functions.len {
+        return false
+    }
+    var tree = &prog.tree
+    var fdecl = tree.functions.data[fn_idx]
+    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var fn_first = fdecl.nodes.first
+    var fn_end = fn_first + fdecl.nodes.count
+    for var nid = fn_first; nid < fn_end; nid += 1 {
+        var nd = nodes[nid as i64]
+        if nd.kind == ast.AstKind.Member && nd.pos <= cursor_off && cursor_off <= nd.pos + nd.b {
+            var mname = span_text(tree, ast.Span { offset: nd.pos, length: nd.b })
+            if str.equals(mname, word) && (nd.a >= fn_first && nd.a < fn_end) {
+                var bt = sema_node_at(sem, fn_idx, fn_first, nd.a).type_info
+                if bt.kind == sema.TypeKind.Pointer {
+                    bt = sem.pointees.data[bt.pointee as i64]
+                }
+                if bt.kind == sema.TypeKind.Struct {
+                    *out_struct_type = bt
+                    return true
+                }
+            }
+        }
+    }
+    return false
+}
+
+fun find_struct_field(tree: *ast.Ast, sem: *sema.Sema, st: sema.SemaType, field_name: []u8,
+                      out_off: *u32, out_type: *sema.SemaType): bool {
+    if st.kind != sema.TypeKind.Struct || (st.record as u64) >= sem.records.len {
+        return false
+    }
+    var sr = &sem.records.data[st.record as i64]
+    var sdecl = tree.structs.data[sr.declaration as i64]
+    var children = vec.as_slice.[u32](&tree.children)
+    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
+        var fid = children[(sdecl.fields.first + i) as i64]
+        var fn_node = nodes[fid as i64]
+        var fname = span_text(tree, ast.Span { offset: fn_node.pos, length: fn_node.a })
+        if str.equals(fname, field_name) {
+            *out_off = fn_node.pos
+            if (i as u64) < sr.fields.len {
+                *out_type = sr.fields.data[i as i64].type_info
+            } else {
+                *out_type = sema.empty_type()
+            }
+            return true
+        }
+    }
+    return false
+}
+
+fun resolve_import_at_cursor(arena: *mem.Arena, ws: *Workspace, doc: *Document,
+                           line0: u64, col0: u64, out_uri: *[]u8,
+                           out_line: *u64, out_col: *u64): bool {
+    var line_off = ast.pos_to_offset(doc.text, line0 + 1, 1)
+    var line = line_slice_at(doc.text, line_off)
+    if !str.starts_with(line, "import ") {
         return false
     }
     var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
@@ -388,8 +678,161 @@ pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     if !word_at(doc.text, local_off, &word, &prefix) {
         return false
     }
+
+    var rest = str.trim(line[7..len(line)])
+    var brace = str.index_of(rest, '{')
+    var mod_spec = rest
+    var in_braces = false
+    if brace >= 0 {
+        mod_spec = str.trim(rest[0..brace])
+        // Check if cursor word appears inside `{ ... }`.
+        var after_brace = rest[(brace + 1)..len(rest)]
+        if str.index_of(after_brace, word[0]) >= 0 && !str.equals(mod_spec, word) {
+            var line_start = line_off as i64
+            for line_start > 0 && doc.text[line_start - 1] != '\n' { line_start -= 1 }
+            var b_pos = str.index_of(doc.text[line_start..len(doc.text)], '{')
+            if b_pos >= 0 && (local_off as i64) > line_start + b_pos {
+                in_braces = true
+            }
+        }
+    }
+
+    // Build stub `import <mod_spec>` to resolve target file via modules loader.
+    var stub = str.concat3(arena, "import ", mod_spec, "\n")
+    var prog: modules.ModuleProgram
+    var sem: sema.Sema
+    var diag: Diagnostic
+    var has_diag = false
+    run_frontend_text(arena, ws, doc, stub, &prog, &sem, &diag, &has_diag)
+    if prog.tree.modules.len < 2 {
+        return false
+    }
+    var target_mod: u32 = 1
+    var mf = prog.files.data[1]
+    if in_braces {
+        var b: ast.AstBinding
+        if find_module_decl(&prog.tree, target_mod, word, true, &b) {
+            var decl_off = binding_decl_offset(&prog.tree, b)
+            offset_to_lsp(arena, &prog, doc, decl_off, out_uri, out_line, out_col)
+            return true
+        }
+    }
+    if path.to_file_uri(arena, mf.path, out_uri) {
+        *out_line = 0
+        *out_col = 0
+        return true
+    }
+    return false
+}
+
+pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[DocSymbol]): bool {
+    if vec.init.[DocSymbol](out_syms, arena, 16) < 0 {
+        return false
+    }
+    var tree: ast.Ast
+    if !ast.init(arena, doc.text, &tree) {
+        return false
+    }
+    var decls: ast.NodeRange
+    var perr: parser.ParseError
+    var clean = sanitize_source(arena, doc.text, 0, false)
+    if !parser.parse_append(arena, &tree, clean, 0, 0, &decls, &perr) {
+        return true
+    }
+    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+    for var i: i64 = 0; i < len(fns); i += 1 {
+        var pos = ast.offset_to_pos(clean, fns[i].name.offset)
+        var sym = DocSymbol {
+            name: span_text(&tree, fns[i].name),
+            kind: 12,
+            line: pos.line - 1,
+            col: pos.col - 1,
+            end_col: (pos.col - 1) + (fns[i].name.length as u64),
+        }
+        vec.push.[DocSymbol](out_syms, &sym)
+    }
+    var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+    for var i: i64 = 0; i < len(structs); i += 1 {
+        var pos = ast.offset_to_pos(clean, structs[i].name.offset)
+        var sym = DocSymbol {
+            name: span_text(&tree, structs[i].name),
+            kind: 23,
+            line: pos.line - 1,
+            col: pos.col - 1,
+            end_col: (pos.col - 1) + (structs[i].name.length as u64),
+        }
+        vec.push.[DocSymbol](out_syms, &sym)
+    }
+    var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+    for var i: i64 = 0; i < len(enums); i += 1 {
+        var pos = ast.offset_to_pos(clean, enums[i].name.offset)
+        var sym = DocSymbol {
+            name: span_text(&tree, enums[i].name),
+            kind: 10,
+            line: pos.line - 1,
+            col: pos.col - 1,
+            end_col: (pos.col - 1) + (enums[i].name.length as u64),
+        }
+        vec.push.[DocSymbol](out_syms, &sym)
+    }
+    var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+    for var i: i64 = 0; i < len(consts); i += 1 {
+        if consts[i].local { continue }
+        var pos = ast.offset_to_pos(clean, consts[i].name.offset)
+        var sym = DocSymbol {
+            name: span_text(&tree, consts[i].name),
+            kind: 14,
+            line: pos.line - 1,
+            col: pos.col - 1,
+            end_col: (pos.col - 1) + (consts[i].name.length as u64),
+        }
+        vec.push.[DocSymbol](out_syms, &sym)
+    }
+    return true
+}
+
+pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
+                   out_uri: *[]u8, out_line: *u64, out_col: *u64): bool {
+    if resolve_import_at_cursor(arena, ws, doc, line0, col0, out_uri, out_line, out_col) {
+        return true
+    }
+    var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
+    var word: []u8
+    var prefix: []u8
+    if !word_at(doc.text, local_off, &word, &prefix) {
+        return false
+    }
+    var prog: modules.ModuleProgram
+    var sem: sema.Sema
+    var ok = run_best_effort(arena, ws, doc, local_off, true, &prog, &sem)
+    if prog.tree.modules.len == 0 {
+        return false
+    }
+    var fn_idx = find_enclosing_fn(&prog.tree, local_off)
+
+    if len(prefix) > 0 && ok && fn_idx >= 0 {
+        var st: sema.SemaType
+        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st) {
+            var foff: u32 = 0
+            var ftype: sema.SemaType
+            if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
+                offset_to_lsp(arena, &prog, doc, foff, out_uri, out_line, out_col)
+                return true
+            }
+        }
+    }
+
+    if len(prefix) == 0 && fn_idx >= 0 {
+        var loff: u32 = 0
+        var lnid: u32 = 0
+        if find_local_at(&prog.tree, fn_idx, local_off, word, &loff, &lnid) {
+            offset_to_lsp(arena, &prog, doc, loff, out_uri, out_line, out_col)
+            return true
+        }
+    }
+
     var b: ast.AstBinding
-    if !resolve_symbol_binding(&prog, doc, word, prefix, &b) {
+    if !resolve_symbol_binding(&prog, word, prefix, &b) {
         return false
     }
     var decl_off = binding_decl_offset(&prog.tree, b)
@@ -399,36 +842,76 @@ pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
 
 pub fun hover(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
               out_md: *[]u8): bool {
-    var prog: modules.ModuleProgram
-    var sem: sema.Sema
-    var diag: Diagnostic
-    var has_diag = false
-    var ok = run_frontend(arena, ws, doc, &prog, &sem, &diag, &has_diag)
-    if prog.tree.modules.len == 0 {
-        return false
-    }
     var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
     var word: []u8
     var prefix: []u8
     if !word_at(doc.text, local_off, &word, &prefix) {
         return false
     }
-    var b: ast.AstBinding
-    if !resolve_symbol_binding(&prog, doc, word, prefix, &b) {
+    var prog: modules.ModuleProgram
+    var sem: sema.Sema
+    var ok = run_best_effort(arena, ws, doc, local_off, true, &prog, &sem)
+    if prog.tree.modules.len == 0 {
         return false
     }
+    var fn_idx = find_enclosing_fn(&prog.tree, local_off)
 
+    if len(prefix) > 0 && ok && fn_idx >= 0 {
+        var st: sema.SemaType
+        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st) {
+            var foff: u32 = 0
+            var ftype: sema.SemaType
+            if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
+                var desc = str.concat3(arena, word, ": ", format_type(arena, &sem, ftype, &prog.tree))
+                *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
+                return true
+            }
+        }
+    }
+
+    if len(prefix) == 0 && fn_idx >= 0 {
+        var loff: u32 = 0
+        var lnid: u32 = 0
+        if find_local_at(&prog.tree, fn_idx, local_off, word, &loff, &lnid) {
+            var nd = prog.tree.nodes.data[lnid as i64]
+            var desc = word
+            if nd.kind == ast.AstKind.Var {
+                desc = line_slice_at(prog.tree.source, loff)
+                // Trim `for ` prefix if this is a C-style for loop initializer.
+                if str.starts_with(desc, "for ") {
+                    var semi = str.index_of(desc, ';')
+                    if semi >= 4 {
+                        desc = str.trim(desc[4..semi])
+                    }
+                }
+            } else if nd.kind == ast.AstKind.Parameter {
+                var rest = prog.tree.source[(loff as i64)..len(prog.tree.source)]
+                var p_end: i64 = 0
+                for p_end < len(rest) && rest[p_end] != ',' && rest[p_end] != ')' && rest[p_end] != '\n' {
+                    p_end += 1
+                }
+                desc = str.trim(rest[0..p_end])
+            }
+            *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
+            return true
+        }
+    }
+
+    var b: ast.AstBinding
+    if !resolve_symbol_binding(&prog, word, prefix, &b) {
+        return false
+    }
     var desc: []u8 = word
     if b.kind == ast.AstBindingKind.Function && ok && (b.index as u64) < sem.functions.len {
         desc = format_fn_sig(arena, &prog.tree, &sem, b.index)
     } else if b.kind == ast.AstBindingKind.Function {
-        desc = str.concat(arena, "fun ", word)
+        desc = format_fn_sig(arena, &prog.tree, &sem, b.index)
     } else if b.kind == ast.AstBindingKind.Struct {
         desc = str.concat(arena, "struct ", word)
     } else if b.kind == ast.AstBindingKind.Enum {
         desc = str.concat(arena, "enum ", word)
     } else if b.kind == ast.AstBindingKind.Const {
-        desc = str.concat(arena, "const ", word)
+        desc = line_slice_at(prog.tree.source, binding_decl_offset(&prog.tree, b))
     } else if b.kind == ast.AstBindingKind.Module {
         desc = str.concat(arena, "module ", word)
     }
@@ -444,18 +927,132 @@ fun binding_completion_kind(k: ast.AstBindingKind): i64 {
     return 9
 }
 
+fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *vec.Vec[CompletionItem]) {
+    if len(dir_path) == 0 { return }
+    var entries: vec.Vec[os.DirEntry]
+    if os.list_dir(dir_path, arena, &entries) < 0 {
+        return
+    }
+    for var i: u64 = 0; i < entries.len; i += 1 {
+        var e = entries.data[i]
+        if e.is_dir {
+            if !str.equals(e.name, "platform") && !str.starts_with(e.name, ".") {
+                var item = CompletionItem { label: e.name, kind: 9, detail: "module" }
+                vec.push.[CompletionItem](out_items, &item)
+            }
+        } else if str.ends_with(e.name, ".lunso") {
+            var stem = str.strip_suffix(e.name, ".lunso")
+            var item = CompletionItem { label: stem, kind: 9, detail: "module" }
+            vec.push.[CompletionItem](out_items, &item)
+        }
+    }
+}
+
+fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
+                           line_off: u32, cursor_off: u32, out_items: *vec.Vec[CompletionItem]): bool {
+    var ls = line_off as i64
+    for ls > 0 && doc.text[ls - 1] != '\n' { ls -= 1 }
+    var line_prefix = doc.text[ls..(cursor_off as i64)]
+    var trimmed = str.trim_left(line_prefix)
+    if !str.starts_with(trimmed, "import ") && !str.equals(trimmed, "import") {
+        return false
+    }
+    var rest: []u8 = ""
+    if len(trimmed) > 7 {
+        rest = str.trim_left(trimmed[7..len(trimmed)])
+    }
+    var last_dot = str.last_index_of(rest, '.')
+    if last_dot < 0 {
+        if len(ws.std_dir) > 0 {
+            var std_item = CompletionItem { label: "std", kind: 9, detail: "standard library" }
+            vec.push.[CompletionItem](out_items, &std_item)
+        }
+        add_dir_completions(arena, path.dir_prefix(doc.path), out_items)
+        if len(ws.root_path) > 0 {
+            add_dir_completions(arena, ws.root_path, out_items)
+        }
+        return true
+    }
+
+    var mod_prefix = rest[0..last_dot]
+    var sub_dir: []u8 = ""
+    if str.equals(mod_prefix, "std") {
+        sub_dir = ws.std_dir
+    } else if str.starts_with(mod_prefix, "std.") {
+        var sub = mod_prefix[4..len(mod_prefix)]
+        sub_dir = path.join(arena, ws.std_dir, sub)
+    } else {
+        var rel = str.clone(arena, mod_prefix)
+        // Replace '.' with '/'
+        var rbuf = data(rel) as *u8
+        for var i: i64 = 0; i < len(rel); i += 1 {
+            if rbuf[i] == '.' { rbuf[i] = '/' }
+        }
+        var doc_dir = path.dir_prefix(doc.path)
+        sub_dir = path.join(arena, doc_dir, rel)
+        add_dir_completions(arena, sub_dir, out_items)
+        if len(ws.root_path) > 0 {
+            add_dir_completions(arena, path.join(arena, ws.root_path, rel), out_items)
+        }
+        return true
+    }
+    add_dir_completions(arena, sub_dir, out_items)
+    return true
+}
+
+fun find_expr_before_dot(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i64,
+                         dot_off: u32, out_type: *sema.SemaType): bool {
+    if fn_idx < 0 || (fn_idx as u64) >= sem.functions.len {
+        return false
+    }
+    var tree = &prog.tree
+    var fdecl = tree.functions.data[fn_idx]
+    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var fn_first = fdecl.nodes.first
+    var fn_end = fn_first + fdecl.nodes.count
+
+    // Find the outermost expression node on the same line whose start <= dot_off and is closest before dot_off.
+    var line_start = dot_off
+    for line_start > 0 && tree.source[(line_start - 1) as i64] != '\n' {
+        line_start -= 1
+    }
+    var best_id = ast.NODE_NONE
+    for var nid = fn_first; nid < fn_end; nid += 1 {
+        var nd = nodes[nid as i64]
+        if nd.pos < line_start || nd.pos >= dot_off {
+            continue
+        }
+        if nd.kind == ast.AstKind.Block || nd.kind == ast.AstKind.Var || nd.kind == ast.AstKind.Return {
+            continue
+        }
+        var t = sema_node_at(sem, fn_idx, fn_first, nid).type_info
+        if t.kind == sema.TypeKind.Invalid || t.kind == sema.TypeKind.Void {
+            continue
+        }
+        // Postfix/outermost expressions are emitted after their children, so the largest nid is the outermost expr.
+        best_id = nid
+    }
+    if best_id == ast.NODE_NONE {
+        return false
+    }
+    var t = sema_node_at(sem, fn_idx, fn_first, best_id).type_info
+    if t.kind == sema.TypeKind.Pointer {
+        t = sem.pointees.data[t.pointee as i64]
+    }
+    *out_type = t
+    return t.kind == sema.TypeKind.Struct
+}
+
 pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
                    out_items: *vec.Vec[CompletionItem]): bool {
     if vec.init.[CompletionItem](out_items, arena, 32) < 0 {
         return false
     }
-    var prog: modules.ModuleProgram
-    var sem: sema.Sema
-    var diag: Diagnostic
-    var has_diag = false
-    run_frontend(arena, ws, doc, &prog, &sem, &diag, &has_diag)
-
     var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
+    if complete_import_line(arena, ws, doc, local_off, local_off, out_items) {
+        return true
+    }
+
     var src = doc.text
     var pos = local_off as i64
     if pos > len(src) { pos = len(src) }
@@ -463,90 +1060,139 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         pos -= 1
     }
 
+    var is_dot = pos >= 2 && src[pos - 1] == '.' && is_ident_char(src[pos - 2]) ||
+                 (pos >= 2 && src[pos - 1] == '.' && (src[pos - 2] == ']' || src[pos - 2] == ')'))
+
+    var prog: modules.ModuleProgram
+    var sem: sema.Sema
+    var ok = run_best_effort(arena, ws, doc, local_off, is_dot, &prog, &sem)
+    if prog.tree.modules.len == 0 {
+        return true
+    }
+
     var scope = &prog.tree.modules.data[0]
-    var target_mod: u32 = 0
-    var only_pub = false
-    var has_target = false
-    if pos >= 2 && src[pos - 1] == '.' && is_ident_char(src[pos - 2]) {
-        var pstart = pos - 2
-        for pstart > 0 && is_ident_char(src[pstart - 1]) {
-            pstart -= 1
-        }
-        var mod_name = src[pstart..(pos - 1)]
-        only_pub = true
-        if prog.tree.modules.len > 0 {
+    if is_dot {
+        var dot_off = (pos - 1) as u32
+        // 1. Check module prefix (`mod.`).
+        if is_ident_char(src[pos - 2]) {
+            var pstart = pos - 2
+            for pstart > 0 && is_ident_char(src[pstart - 1]) {
+                pstart -= 1
+            }
+            var mod_name = src[pstart..(pos - 1)]
             var mb: ast.AstBinding
             if find_binding(scope, mod_name, &mb) && mb.kind == ast.AstBindingKind.Module {
-                target_mod = mb.index
-                has_target = true
+                var target_mod = mb.index
+                var tree = &prog.tree
+                var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+                for var i: i64 = 0; i < len(fns); i += 1 {
+                    if fns[i].module == target_mod && fns[i].public {
+                        var item = CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: "" }
+                        vec.push.[CompletionItem](out_items, &item)
+                    }
+                }
+                var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+                for var i: i64 = 0; i < len(structs); i += 1 {
+                    if structs[i].module == target_mod && structs[i].public {
+                        var item = CompletionItem { label: span_text(tree, structs[i].name), kind: 22, detail: "" }
+                        vec.push.[CompletionItem](out_items, &item)
+                    }
+                }
+                var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+                for var i: i64 = 0; i < len(enums); i += 1 {
+                    if enums[i].module == target_mod && enums[i].public {
+                        var item = CompletionItem { label: span_text(tree, enums[i].name), kind: 13, detail: "" }
+                        vec.push.[CompletionItem](out_items, &item)
+                    }
+                }
+                var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+                for var i: i64 = 0; i < len(consts); i += 1 {
+                    if !consts[i].local && consts[i].module == target_mod && consts[i].public {
+                        var item = CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: "" }
+                        vec.push.[CompletionItem](out_items, &item)
+                    }
+                }
+                return true
             }
         }
-        if !has_target {
-            // Fallback when the current file has a syntax error (e.g. incomplete `mod.`).
-            var stub = str.concat3(arena, "import ", mod_name, "\n")
-            var stub_prog: modules.ModuleProgram
-            var stub_sem: sema.Sema
-            var dummy_diag: Diagnostic
-            var dummy_has = false
-            var saved_text = doc.text
-            doc.text = stub
-            run_frontend(arena, ws, doc, &stub_prog, &stub_sem, &dummy_diag, &dummy_has)
-            doc.text = saved_text
-            if stub_prog.tree.modules.len > 0 {
-                var mb2: ast.AstBinding
-                if find_binding(&stub_prog.tree.modules.data[0], mod_name, &mb2) && mb2.kind == ast.AstBindingKind.Module {
-                    prog = stub_prog
-                    target_mod = mb2.index
-                    has_target = true
+
+        // 2. Expression member completion (`items[0].`, `tokens.`, `wrap.[Inner](...).`).
+        if ok {
+            var fn_idx = find_enclosing_fn(&prog.tree, local_off)
+            var st: sema.SemaType
+            if find_expr_before_dot(&prog, &sem, fn_idx, dot_off, &st) && (st.record as u64) < sem.records.len {
+                var sr = &sem.records.data[st.record as i64]
+                var sdecl = prog.tree.structs.data[sr.declaration as i64]
+                var children = vec.as_slice.[u32](&prog.tree.children)
+                var nodes = vec.as_slice.[ast.AstNode](&prog.tree.nodes)
+                for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
+                    var fid = children[(sdecl.fields.first + i) as i64]
+                    var fn_node = nodes[fid as i64]
+                    var fname = span_text(&prog.tree, ast.Span { offset: fn_node.pos, length: fn_node.a })
+                    var det: []u8 = ""
+                    if (i as u64) < sr.fields.len {
+                        det = str.concat3(arena, fname, ": ", format_type(arena, &sem, sr.fields.data[i as i64].type_info, &prog.tree))
+                    }
+                    var item = CompletionItem { label: fname, kind: 5, detail: det }
+                    vec.push.[CompletionItem](out_items, &item)
                 }
             }
         }
-        if !has_target {
-            return true
-        }
-    } else if prog.tree.modules.len == 0 {
         return true
     }
 
     var tree = &prog.tree
+    var fn_idx = find_enclosing_fn(tree, local_off)
+    if fn_idx >= 0 {
+        var lnames: vec.Vec[[]u8]
+        var loffs: vec.Vec[u32]
+        var lnids: vec.Vec[u32]
+        vec.init.[[]u8](&lnames, arena, 16)
+        vec.init.[u32](&loffs, arena, 16)
+        vec.init.[u32](&lnids, arena, 16)
+        collect_in_scope_locals(tree, fn_idx, local_off, &lnames, &loffs, &lnids)
+        for var i: u64 = 0; i < lnames.len; i += 1 {
+            var item = CompletionItem { label: lnames.data[i], kind: 6, detail: "" }
+            vec.push.[CompletionItem](out_items, &item)
+        }
+    }
+
     var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
     for var i: i64 = 0; i < len(fns); i += 1 {
-        if fns[i].module == target_mod && (!only_pub || fns[i].public) {
+        if fns[i].module == 0 {
             var item = CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: "" }
             vec.push.[CompletionItem](out_items, &item)
         }
     }
     var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
     for var i: i64 = 0; i < len(structs); i += 1 {
-        if structs[i].module == target_mod && (!only_pub || structs[i].public) {
+        if structs[i].module == 0 {
             var item = CompletionItem { label: span_text(tree, structs[i].name), kind: 22, detail: "" }
             vec.push.[CompletionItem](out_items, &item)
         }
     }
     var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
     for var i: i64 = 0; i < len(enums); i += 1 {
-        if enums[i].module == target_mod && (!only_pub || enums[i].public) {
+        if enums[i].module == 0 {
             var item = CompletionItem { label: span_text(tree, enums[i].name), kind: 13, detail: "" }
             vec.push.[CompletionItem](out_items, &item)
         }
     }
     var consts = vec.as_slice.[ast.AstConst](&tree.consts)
     for var i: i64 = 0; i < len(consts); i += 1 {
-        if !consts[i].local && consts[i].module == target_mod && (!only_pub || consts[i].public) {
+        if !consts[i].local && consts[i].module == 0 {
             var item = CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: "" }
             vec.push.[CompletionItem](out_items, &item)
         }
     }
-    if !only_pub {
-        var bs = vec.as_slice.[ast.AstBinding](&scope.bindings)
-        for var i: i64 = 0; i < len(bs); i += 1 {
-            var item = CompletionItem {
-                label: bs[i].name,
-                kind: binding_completion_kind(bs[i].kind),
-                detail: "",
-            }
-            vec.push.[CompletionItem](out_items, &item)
+    var bs = vec.as_slice.[ast.AstBinding](&scope.bindings)
+    for var i: i64 = 0; i < len(bs); i += 1 {
+        var item = CompletionItem {
+            label: bs[i].name,
+            kind: binding_completion_kind(bs[i].kind),
+            detail: "",
         }
+        vec.push.[CompletionItem](out_items, &item)
     }
     return true
 }

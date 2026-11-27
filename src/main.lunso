@@ -1,4 +1,5 @@
 import std.args
+import std.file
 import std.json
 import std.map
 import std.mem
@@ -9,16 +10,18 @@ import std.vec
 import analysis
 import transport
 
-fun make_range(arena: *mem.Arena, line: u64, col: u64, out: *json.JsonValue): bool {
+fun make_range(arena: *mem.Arena, line: u64, col: u64, end_col: u64, out: *json.JsonValue): bool {
     var start: json.JsonValue
     var end_pos: json.JsonValue
     if json.object_val(arena, &start) < 0 || json.object_val(arena, &end_pos) < 0 || json.object_val(arena, out) < 0 {
         return false
     }
+    var ec = end_col
+    if ec <= col { ec = col + 1 }
     if json.set(arena, &start, "line", json.int_val(line as i64)) < 0 ||
        json.set(arena, &start, "character", json.int_val(col as i64)) < 0 ||
        json.set(arena, &end_pos, "line", json.int_val(line as i64)) < 0 ||
-       json.set(arena, &end_pos, "character", json.int_val((col + 1) as i64)) < 0 ||
+       json.set(arena, &end_pos, "character", json.int_val(ec as i64)) < 0 ||
        json.set(arena, out, "start", start) < 0 ||
        json.set(arena, out, "end", end_pos) < 0 {
         return false
@@ -43,7 +46,7 @@ fun publish_diagnostics(arena: *mem.Arena, ws: *analysis.Workspace, uri: []u8) {
     if has_diag {
         var range: json.JsonValue
         var d: json.JsonValue
-        if make_range(arena, diag.line, diag.col, &range) && json.object_val(arena, &d) >= 0 {
+        if make_range(arena, diag.line, diag.col, diag.col + 1, &range) && json.object_val(arena, &d) >= 0 {
             json.set(arena, &d, "range", range)
             json.set(arena, &d, "severity", json.int_val(1))
             json.set(arena, &d, "source", json.str_val("lunso"))
@@ -98,6 +101,7 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     json.object_val(arena, &sync)
     json.set(arena, &sync, "openClose", json.bool_val(true))
     json.set(arena, &sync, "change", json.int_val(1))
+    json.set(arena, &sync, "save", json.bool_val(true))
 
     json.array_val(arena, &trig)
     json.push(&trig, json.str_val("."))
@@ -106,6 +110,7 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
 
     json.object_val(arena, &caps)
     json.set(arena, &caps, "textDocumentSync", sync)
+    json.set(arena, &caps, "documentSymbolProvider", json.bool_val(true))
     json.set(arena, &caps, "hoverProvider", json.bool_val(true))
     json.set(arena, &caps, "definitionProvider", json.bool_val(true))
     json.set(arena, &caps, "completionProvider", comp)
@@ -118,6 +123,38 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     json.set(arena, &res, "capabilities", caps)
     json.set(arena, &res, "serverInfo", info)
     transport.send_response(arena, id, res)
+}
+
+fun handle_document_symbol(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
+    var td: json.JsonValue
+    var uri: []u8
+    var arr: json.JsonValue
+    json.array_val(arena, &arr)
+    var doc: *analysis.Document
+    if json.get(params, "textDocument", &td) &&
+       json.get_str(td, "uri", &uri) &&
+       map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+        var syms: vec.Vec[analysis.DocSymbol]
+        if analysis.document_symbols(arena, doc, &syms) {
+            for var i: u64 = 0; i < syms.len; i += 1 {
+                var s = syms.data[i]
+                var range: json.JsonValue
+                var loc: json.JsonValue
+                var obj: json.JsonValue
+                if make_range(arena, s.line, s.col, s.end_col, &range) &&
+                   json.object_val(arena, &loc) >= 0 &&
+                   json.object_val(arena, &obj) >= 0 {
+                    json.set(arena, &loc, "uri", json.str_val(doc.uri))
+                    json.set(arena, &loc, "range", range)
+                    json.set(arena, &obj, "name", json.str_val(s.name))
+                    json.set(arena, &obj, "kind", json.int_val(s.kind))
+                    json.set(arena, &obj, "location", loc)
+                    json.push(&arr, obj)
+                }
+            }
+        }
+    }
+    transport.send_response(arena, id, arr)
 }
 
 fun handle_hover(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
@@ -162,7 +199,7 @@ fun handle_definition(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     }
     var range: json.JsonValue
     var loc: json.JsonValue
-    make_range(arena, target_line, target_col, &range)
+    make_range(arena, target_line, target_col, target_col + 1, &range)
     json.object_val(arena, &loc)
     json.set(arena, &loc, "uri", json.str_val(target_uri))
     json.set(arena, &loc, "range", range)
@@ -185,6 +222,9 @@ fun handle_completion(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
                 if json.object_val(arena, &obj) >= 0 {
                     json.set(arena, &obj, "label", json.str_val(it.label))
                     json.set(arena, &obj, "kind", json.int_val(it.kind))
+                    if len(it.detail) > 0 {
+                        json.set(arena, &obj, "detail", json.str_val(it.detail))
+                    }
                     json.push(&arr, obj)
                 }
             }
@@ -193,12 +233,24 @@ fun handle_completion(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     transport.send_response(arena, id, arr)
 }
 
+fun detect_std_dir(arena: *mem.Arena): []u8 {
+    var env_val: []u8
+    if os.getenv("LUNSO_STD_DIR", arena, &env_val) == 0 && len(env_val) > 0 {
+        return env_val
+    }
+    if file.exists("std/io.lunso") { return "std" }
+    if file.exists("../lunsoc/std/io.lunso") { return "../lunsoc/std" }
+    return ""
+}
+
 fun main(): i32 {
     var ws: analysis.Workspace
     if !analysis.workspace_init(&ws, "") {
         return 1
     }
     defer analysis.workspace_deinit(&ws)
+
+    ws.std_dir = detect_std_dir(&ws.arena)
 
     var cli_args: [][]u8
     if args.load(&ws.arena, &cli_args) > 0 {
@@ -282,6 +334,12 @@ fun main(): i32 {
                         publish_diagnostics(&req_arena, &ws, uri)
                     }
                 }
+            } else if str.equals(method, "textDocument/didSave") {
+                var td: json.JsonValue
+                var uri: []u8
+                if json.get(params, "textDocument", &td) && json.get_str(td, "uri", &uri) {
+                    publish_diagnostics(&req_arena, &ws, uri)
+                }
             } else if str.equals(method, "textDocument/didClose") {
                 var td: json.JsonValue
                 var uri: []u8
@@ -295,6 +353,8 @@ fun main(): i32 {
                     json.set(&req_arena, &empty_p, "diagnostics", arr)
                     transport.send_notification(&req_arena, "textDocument/publishDiagnostics", empty_p)
                 }
+            } else if str.equals(method, "textDocument/documentSymbol") && has_id {
+                handle_document_symbol(&req_arena, &ws, id, params)
             } else if str.equals(method, "textDocument/hover") && has_id {
                 handle_hover(&req_arena, &ws, id, params)
             } else if str.equals(method, "textDocument/definition") && has_id {
