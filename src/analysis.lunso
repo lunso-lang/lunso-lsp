@@ -1043,21 +1043,35 @@ fun find_expr_before_dot(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: 
     return t.kind == sema.TypeKind.Struct
 }
 
+fun push_completion(out_items: *vec.Vec[CompletionItem], prefix: []u8, item: CompletionItem) {
+    if len(prefix) > 0 && !str.starts_with(item.label, prefix) {
+        return
+    }
+    vec.push.[CompletionItem](out_items, &item)
+}
+
 pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
                    out_items: *vec.Vec[CompletionItem]): bool {
     if vec.init.[CompletionItem](out_items, arena, 32) < 0 {
         return false
     }
     var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
-    if complete_import_line(arena, ws, doc, local_off, local_off, out_items) {
-        return true
-    }
-
     var src = doc.text
-    var pos = local_off as i64
-    if pos > len(src) { pos = len(src) }
+    var word_end = local_off as i64
+    if word_end > len(src) { word_end = len(src) }
+    var pos = word_end
     for pos > 0 && is_ident_char(src[pos - 1]) {
         pos -= 1
+    }
+    var typed_prefix = src[pos..word_end]
+
+    var raw_items: vec.Vec[CompletionItem]
+    vec.init.[CompletionItem](&raw_items, arena, 32)
+    if complete_import_line(arena, ws, doc, local_off, local_off, &raw_items) {
+        for var i: u64 = 0; i < raw_items.len; i += 1 {
+            push_completion(out_items, typed_prefix, raw_items.data[i])
+        }
+        return true
     }
 
     var is_dot = pos >= 2 && src[pos - 1] == '.' && is_ident_char(src[pos - 2]) ||
@@ -1088,31 +1102,27 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
                 for var i: i64 = 0; i < len(fns); i += 1 {
                     if fns[i].module == target_mod && fns[i].public {
                         var sig = format_fn_sig(arena, tree, &sem, i as u32)
-                        var item = CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig }
-                        vec.push.[CompletionItem](out_items, &item)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig })
                     }
                 }
                 var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
                 for var i: i64 = 0; i < len(structs); i += 1 {
                     if structs[i].module == target_mod && structs[i].public {
                         var sname = span_text(tree, structs[i].name)
-                        var item = CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) }
-                        vec.push.[CompletionItem](out_items, &item)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) })
                     }
                 }
                 var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
                 for var i: i64 = 0; i < len(enums); i += 1 {
                     if enums[i].module == target_mod && enums[i].public {
                         var ename = span_text(tree, enums[i].name)
-                        var item = CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) }
-                        vec.push.[CompletionItem](out_items, &item)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
                     }
                 }
                 var consts = vec.as_slice.[ast.AstConst](&tree.consts)
                 for var i: i64 = 0; i < len(consts); i += 1 {
                     if !consts[i].local && consts[i].module == target_mod && consts[i].public {
-                        var item = CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) }
-                        vec.push.[CompletionItem](out_items, &item)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) })
                     }
                 }
                 return true
@@ -1136,8 +1146,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
                     if (i as u64) < sr.fields.len {
                         det = str.concat3(arena, fname, ": ", format_type(arena, &sem, sr.fields.data[i as i64].type_info, &prog.tree))
                     }
-                    var item = CompletionItem { label: fname, kind: 5, detail: det }
-                    vec.push.[CompletionItem](out_items, &item)
+                    push_completion(out_items, typed_prefix, CompletionItem { label: fname, kind: 5, detail: det })
                 }
             }
         }
@@ -1155,8 +1164,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         vec.init.[u32](&lnids, arena, 16)
         collect_in_scope_locals(tree, fn_idx, local_off, &lnames, &loffs, &lnids)
         for var i: u64 = 0; i < lnames.len; i += 1 {
-            var item = CompletionItem { label: lnames.data[i], kind: 6, detail: "" }
-            vec.push.[CompletionItem](out_items, &item)
+            push_completion(out_items, typed_prefix, CompletionItem { label: lnames.data[i], kind: 6, detail: "" })
         }
     }
 
@@ -1164,31 +1172,27 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     for var i: i64 = 0; i < len(fns); i += 1 {
         if fns[i].module == 0 {
             var sig = format_fn_sig(arena, tree, &sem, i as u32)
-            var item = CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig }
-            vec.push.[CompletionItem](out_items, &item)
+            push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig })
         }
     }
     var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
     for var i: i64 = 0; i < len(structs); i += 1 {
         if structs[i].module == 0 {
             var sname = span_text(tree, structs[i].name)
-            var item = CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) }
-            vec.push.[CompletionItem](out_items, &item)
+            push_completion(out_items, typed_prefix, CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) })
         }
     }
     var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
     for var i: i64 = 0; i < len(enums); i += 1 {
         if enums[i].module == 0 {
             var ename = span_text(tree, enums[i].name)
-            var item = CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) }
-            vec.push.[CompletionItem](out_items, &item)
+            push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
         }
     }
     var consts = vec.as_slice.[ast.AstConst](&tree.consts)
     for var i: i64 = 0; i < len(consts); i += 1 {
         if !consts[i].local && consts[i].module == 0 {
-            var item = CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) }
-            vec.push.[CompletionItem](out_items, &item)
+            push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) })
         }
     }
     var bs = vec.as_slice.[ast.AstBinding](&scope.bindings)
@@ -1197,12 +1201,11 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         if bs[i].kind == ast.AstBindingKind.Function && (bs[i].index as u64) < tree.functions.len {
             det = format_fn_sig(arena, tree, &sem, bs[i].index)
         }
-        var item = CompletionItem {
+        push_completion(out_items, typed_prefix, CompletionItem {
             label: bs[i].name,
             kind: binding_completion_kind(bs[i].kind),
             detail: det,
-        }
-        vec.push.[CompletionItem](out_items, &item)
+        })
     }
 
     var kws: [20][]u8 = [
@@ -1211,8 +1214,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         "true", "false"
     ]
     for var i: i64 = 0; i < 20; i += 1 {
-        var item = CompletionItem { label: kws[i], kind: 14, detail: "keyword" }
-        vec.push.[CompletionItem](out_items, &item)
+        push_completion(out_items, typed_prefix, CompletionItem { label: kws[i], kind: 14, detail: "keyword" })
     }
     return true
 }

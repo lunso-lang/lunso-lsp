@@ -329,6 +329,19 @@ class TestLunsoLsp(unittest.TestCase):
             self.assertIn("defer", comp_main)
             self.assertIn("return", comp_main)
 
+            # Prefix filtering on completion: typing "a" must not return "false"
+            send({
+                "jsonrpc": "2.0",
+                "id": 78,
+                "method": "textDocument/completion",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 36, "character": 5}},
+            })
+            # At line 36 ("    return helper(local_val)"), char 5 is "r" -> only 'r*' items
+            comp_r = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("return", comp_r)
+            self.assertNotIn("false", comp_r)
+            self.assertNotIn("defer", comp_r)
+
             # signatureHelp on math.add_two(x) at line 20 char 24
             send({
                 "jsonrpc": "2.0",
