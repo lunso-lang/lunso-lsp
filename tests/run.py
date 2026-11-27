@@ -340,6 +340,17 @@ class TestLunsoLsp(unittest.TestCase):
             self.assertIn("pub fun add_two(v: i32): i32", sig_resp["signatures"][0]["label"])
             self.assertEqual(sig_resp["activeParameter"], 0)
 
+            # signatureHelp on struct literal `Box[T] { value: item }` at line 17 char 22
+            send({
+                "jsonrpc": "2.0",
+                "id": 77,
+                "method": "textDocument/signatureHelp",
+                "params": {"textDocument": {"uri": uri}, "position": {"line": 17, "character": 22}},
+            })
+            ssig_resp = read_msg(proc.stdout)["result"]
+            self.assertIn("struct Box { value: T }", ssig_resp["signatures"][0]["label"])
+            self.assertEqual(ssig_resp["signatures"][0]["parameters"][0]["label"], "value: T")
+
             # 7. Diagnostics on valid single-file change
             send({
                 "jsonrpc": "2.0",
