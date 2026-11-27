@@ -31,7 +31,7 @@ fun make_range(arena: *mem.Arena, line: u64, col: u64, end_col: u64, out: *json.
 
 fun publish_diagnostics(arena: *mem.Arena, ws: *analysis.Workspace, uri: []u8) {
     var doc: *analysis.Document
-    if !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if !ws.docs.get_ptr(uri, &doc) {
         return
     }
     var diag: analysis.Diagnostic
@@ -132,7 +132,7 @@ fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
 
     json.object_val(arena, &info)
     json.set(arena, &info, "name", json.str_val("lunso-lsp"))
-    json.set(arena, &info, "version", json.str_val("0.3.1"))
+    json.set(arena, &info, "version", json.str_val("0.3.2"))
 
     json.object_val(arena, &res)
     json.set(arena, &res, "capabilities", caps)
@@ -148,7 +148,7 @@ fun handle_document_symbol(arena: *mem.Arena, ws: *analysis.Workspace, id: json.
     var doc: *analysis.Document
     if json.get(params, "textDocument", &td) &&
        json.get_str(td, "uri", &uri) &&
-       map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+       ws.docs.get_ptr(uri, &doc) {
         var syms: vec.Vec[analysis.DocSymbol]
         if analysis.document_symbols(arena, doc, &syms) {
             for var i: u64 = 0; i < syms.len; i += 1 {
@@ -177,7 +177,7 @@ fun handle_signature_help(arena: *mem.Arena, ws: *analysis.Workspace, id: json.J
     var line: u64 = 0
     var col: u64 = 0
     var doc: *analysis.Document
-    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if !extract_position(params, &uri, &line, &col) || !ws.docs.get_ptr(uri, &doc) {
         transport.send_response(arena, id, json.null_val())
         return
     }
@@ -215,7 +215,7 @@ fun handle_hover(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue,
     var line: u64 = 0
     var col: u64 = 0
     var doc: *analysis.Document
-    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if !extract_position(params, &uri, &line, &col) || !ws.docs.get_ptr(uri, &doc) {
         transport.send_response(arena, id, json.null_val())
         return
     }
@@ -239,7 +239,7 @@ fun handle_definition(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     var line: u64 = 0
     var col: u64 = 0
     var doc: *analysis.Document
-    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if !extract_position(params, &uri, &line, &col) || !ws.docs.get_ptr(uri, &doc) {
         transport.send_response(arena, id, json.null_val())
         return
     }
@@ -266,7 +266,7 @@ fun handle_completion(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     var doc: *analysis.Document
     var arr: json.JsonValue
     json.array_val(arena, &arr)
-    if extract_position(params, &uri, &line, &col) && map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if extract_position(params, &uri, &line, &col) && ws.docs.get_ptr(uri, &doc) {
         var items: vec.Vec[analysis.CompletionItem]
         if analysis.completion(arena, ws, doc, line, col, &items) {
             for var i: u64 = 0; i < items.len; i += 1 {
@@ -291,7 +291,7 @@ fun handle_signature_help(arena: *mem.Arena, ws: *analysis.Workspace, id: json.J
     var line: u64 = 0
     var col: u64 = 0
     var doc: *analysis.Document
-    if !extract_position(params, &uri, &line, &col) || !map.get_ptr.[analysis.Document](&ws.docs, uri, &doc) {
+    if !extract_position(params, &uri, &line, &col) || !ws.docs.get_ptr(uri, &doc) {
         transport.send_response(arena, id, json.null_val())
         return
     }
@@ -356,24 +356,24 @@ fun main(): i32 {
     var shutdown_requested = false
     for {
         var req_arena: mem.Arena
-        if mem.init(&req_arena, 65536) < 0 {
+        if req_arena.init(65536) < 0 {
             return 1
         }
 
         var body: []u8
         var rr = transport.read_message(&req_arena, &body)
         if rr == 0 {
-            mem.deinit(&req_arena)
+            req_arena.deinit()
             break
         }
         if rr < 0 {
-            mem.deinit(&req_arena)
+            req_arena.deinit()
             return 1
         }
 
         var msg: json.JsonValue
         if !json.parse(&req_arena, body, &msg) || msg.kind != json.JsonKind.Object {
-            mem.deinit(&req_arena)
+            req_arena.deinit()
             continue
         }
 
@@ -393,7 +393,7 @@ fun main(): i32 {
                 shutdown_requested = true
                 transport.send_response(&req_arena, id, json.null_val())
             } else if str.equals(method, "exit") {
-                mem.deinit(&req_arena)
+                req_arena.deinit()
                 if shutdown_requested { return 0 }
                 return 1
             } else if str.equals(method, "textDocument/didOpen") {
@@ -459,7 +459,7 @@ fun main(): i32 {
             }
         }
 
-        mem.deinit(&req_arena)
+        req_arena.deinit()
     }
 
     if shutdown_requested { return 0 }

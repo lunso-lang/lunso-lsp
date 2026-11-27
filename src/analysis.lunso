@@ -49,13 +49,13 @@ pub struct DocSymbol {
 }
 
 pub fun workspace_init(ws: *Workspace, std_dir: []u8): bool {
-    if mem.init(&ws.arena, 16384) < 0 {
+    if ws.arena.init(16384) < 0 {
         return false
     }
-    if map.init.[Document](&ws.docs, &ws.arena, 16) < 0 {
+    if ws.docs.init(&ws.arena, 16) < 0 {
         return false
     }
-    if vec.init.[[]u8](&ws.uris, &ws.arena, 16) < 0 {
+    if ws.uris.init(&ws.arena, 16) < 0 {
         return false
     }
     ws.std_dir = std_dir
@@ -66,23 +66,23 @@ pub fun workspace_init(ws: *Workspace, std_dir: []u8): bool {
 pub fun workspace_deinit(ws: *Workspace) {
     for var i: u64 = 0; i < ws.uris.len; i += 1 {
         var doc: *Document
-        if map.get_ptr.[Document](&ws.docs, ws.uris.data[i], &doc) {
-            mem.deinit(&doc.arena)
+        if ws.docs.get_ptr(ws.uris.data[i], &doc) {
+            doc.arena.deinit()
         }
     }
-    mem.deinit(&ws.arena)
+    ws.arena.deinit()
 }
 
 pub fun doc_open(ws: *Workspace, uri: []u8, text: []u8, version: i64): bool {
-    var existed = map.has.[Document](&ws.docs, uri)
+    var existed = ws.docs.has(uri)
     var doc: Document
     if existed {
         var old: *Document
-        if map.get_ptr.[Document](&ws.docs, uri, &old) {
-            mem.deinit(&old.arena)
+        if ws.docs.get_ptr(uri, &old) {
+            old.arena.deinit()
         }
     }
-    if mem.init(&doc.arena, 8192) < 0 {
+    if doc.arena.init(8192) < 0 {
         return false
     }
     doc.uri = str.clone(&doc.arena, uri)
@@ -94,37 +94,37 @@ pub fun doc_open(ws: *Workspace, uri: []u8, text: []u8, version: i64): bool {
     }
     doc.text = str.clone(&doc.arena, text)
     if len(text) > 0 && len(doc.text) == 0 {
-        mem.deinit(&doc.arena)
+        doc.arena.deinit()
         return false
     }
     doc.version = version
-    if map.set.[Document](&ws.docs, uri, doc) < 0 {
-        mem.deinit(&doc.arena)
+    if ws.docs.set(uri, doc) < 0 {
+        doc.arena.deinit()
         return false
     }
     if !existed {
         var ucopy = str.clone(&ws.arena, uri)
-        vec.push_value.[[]u8](&ws.uris, ucopy)
+        ws.uris.push_value(ucopy)
     }
     return true
 }
 
 pub fun doc_close(ws: *Workspace, uri: []u8) {
     var doc: *Document
-    if map.get_ptr.[Document](&ws.docs, uri, &doc) {
-        mem.deinit(&doc.arena)
+    if ws.docs.get_ptr(uri, &doc) {
+        doc.arena.deinit()
     }
-    map.remove.[Document](&ws.docs, uri)
+    ws.docs.remove(uri)
 }
 
 fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *map.StrMap[[]u8]): bool {
-    if map.init.[[]u8](out, arena, 16) < 0 {
+    if out.init(arena, 16) < 0 {
         return false
     }
     for var i: u64 = 0; i < ws.uris.len; i += 1 {
         var doc: *Document
-        if map.get_ptr.[Document](&ws.docs, ws.uris.data[i], &doc) {
-            if map.set.[[]u8](out, doc.path, doc.text) < 0 {
+        if ws.docs.get_ptr(ws.uris.data[i], &doc) {
+            if out.set(doc.path, doc.text) < 0 {
                 return false
             }
         }
@@ -133,13 +133,13 @@ fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *map.StrMap[[]u8]): b
 }
 
 fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out: *vec.Vec[[]u8]) {
-    vec.init.[[]u8](out, arena, 8)
+    out.init(arena, 8)
     if len(ws.root_path) > 0 {
-        vec.push_value.[[]u8](out, ws.root_path)
+        out.push_value(ws.root_path)
     }
     var cur = path.dir_prefix(doc_path)
     for var depth: i32 = 0; depth < 4 && len(cur) > 1; depth += 1 {
-        vec.push_value.[[]u8](out, cur)
+        out.push_value(cur)
         var trimmed = cur[0..(len(cur) - 1)]
         cur = path.dir_prefix(trimmed)
     }
@@ -147,7 +147,7 @@ fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out:
 
 fun offset_to_lsp(arena: *mem.Arena, prog: *modules.ModuleProgram, doc: *Document,
                   global_off: u32, out_uri: *[]u8, out_line: *u64, out_col: *u64) {
-    var files = vec.as_slice.[modules.ModuleFile](&prog.files)
+    var files = prog.files.as_slice()
     var fi = modules.find_file_at(files, global_off)
     if fi >= 0 {
         var mf = files[fi]
@@ -177,14 +177,14 @@ fun run_frontend_text(arena: *mem.Arena, ws: *Workspace, doc: *Document, src_tex
     if !build_overlays(arena, ws, &overlays) {
         return false
     }
-    map.set.[[]u8](&overlays, doc.path, src_text)
+    overlays.set(doc.path, src_text)
 
     var inc_dirs: vec.Vec[[]u8]
     collect_include_dirs(arena, ws, doc.path, &inc_dirs)
 
     prog.quiet = true
     if !modules.load_with_overlays(arena, doc.path, src_text, ws.std_dir,
-                                   vec.as_slice.[[]u8](&inc_dirs), &overlays, prog) {
+                                   inc_dirs.as_slice(), &overlays, prog) {
         if prog.has_error {
             var duri: []u8
             var dline: u64 = 0
@@ -220,7 +220,7 @@ fun sanitize_source(arena: *mem.Arena, src: []u8, cursor_off: u32, strip_cursor_
     var n = len(src)
     if n == 0 { return "" }
     var buf: *u8
-    if mem.alloc(arena, n as u64, 1, &buf) < 0 {
+    if arena.alloc(n as u64, 1, &buf) < 0 {
         return src
     }
     for var i: i64 = 0; i < n; i += 1 {
@@ -325,7 +325,7 @@ fun span_text(tree: *ast.Ast, sp: ast.Span): []u8 {
 }
 
 fun find_binding(scope: *ast.AstModuleScope, name: []u8, out: *ast.AstBinding): bool {
-    var bs = vec.as_slice.[ast.AstBinding](&scope.bindings)
+    var bs = scope.bindings.as_slice()
     for var i: i64 = 0; i < len(bs); i += 1 {
         if str.equals(bs[i].name, name) {
             *out = bs[i]
@@ -371,11 +371,15 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
     }
     if t.kind == sema.TypeKind.Pointer {
         var pt = sem.pointees.data[t.pointee as i64]
-        return str.concat(arena, "*", format_type(arena, sem, pt, tree))
+        var pfx = "*"
+        if t.read_only { pfx = "*const " }
+        return str.concat(arena, pfx, format_type(arena, sem, pt, tree))
     }
     if t.kind == sema.TypeKind.Slice {
         var et = sem.elements.data[t.element_type as i64]
-        return str.concat(arena, "[]", format_type(arena, sem, et, tree))
+        var pfx = "[]"
+        if t.read_only { pfx = "[]const " }
+        return str.concat(arena, pfx, format_type(arena, sem, et, tree))
     }
     if t.kind == sema.TypeKind.Array {
         var et = sem.elements.data[t.element_type as i64]
@@ -410,55 +414,55 @@ fun format_fn_sig(arena: *mem.Arena, tree: *ast.Ast, sem: *sema.Sema, fn_idx: u3
     }
     var sf = sem.functions.data[fn_idx as i64]
     var buf: vec.Vec[u8]
-    vec.init.[u8](&buf, arena, 128)
-    if fdecl.public { vec.append_slice.[u8](&buf, "pub ") }
-    vec.append_slice.[u8](&buf, "fun ")
-    vec.append_slice.[u8](&buf, span_text(tree, fdecl.name))
-    vec.push_value.[u8](&buf, '(')
-    var children = vec.as_slice.[u32](&tree.children)
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    buf.init(arena, 128)
+    if fdecl.public { buf.append_slice("pub ") }
+    buf.append_slice("fun ")
+    buf.append_slice(span_text(tree, fdecl.name))
+    buf.push_value('(')
+    var children = tree.children.as_slice()
+    var nodes = tree.nodes.as_slice()
     for var i: u32 = 0; i < fdecl.parameters.count; i += 1 {
-        if i > 0 { vec.append_slice.[u8](&buf, ", ") }
+        if i > 0 { buf.append_slice(", ") }
         var pid = children[(fdecl.parameters.first + i) as i64]
         var pn = nodes[pid as i64]
         var pname = ast.Span { offset: pn.pos, length: pn.a }
-        vec.append_slice.[u8](&buf, span_text(tree, pname))
-        vec.append_slice.[u8](&buf, ": ")
+        buf.append_slice(span_text(tree, pname))
+        buf.append_slice(": ")
         if (i as u64) < sf.param_types.len {
-            vec.append_slice.[u8](&buf, format_type(arena, sem, sf.param_types.data[i as i64], tree))
+            buf.append_slice(format_type(arena, sem, sf.param_types.data[i as i64], tree))
         }
     }
-    vec.push_value.[u8](&buf, ')')
+    buf.push_value(')')
     if sf.result.kind != sema.TypeKind.Void {
-        vec.append_slice.[u8](&buf, ": ")
-        vec.append_slice.[u8](&buf, format_type(arena, sem, sf.result, tree))
+        buf.append_slice(": ")
+        buf.append_slice(format_type(arena, sem, sf.result, tree))
     }
-    return vec.as_slice.[u8](&buf)
+    return buf.as_slice()
 }
 
 fun find_module_decl(tree: *ast.Ast, mod_idx: u32, name: []u8, only_pub: bool, out: *ast.AstBinding): bool {
-    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+    var fns = tree.functions.as_slice()
     for var i: i64 = 0; i < len(fns); i += 1 {
-        if fns[i].module == mod_idx && (!only_pub || fns[i].public) && str.equals(span_text(tree, fns[i].name), name) {
+        if fns[i].owner_struct == (~0 as u32) && fns[i].module == mod_idx && (!only_pub || fns[i].public) && str.equals(span_text(tree, fns[i].name), name) {
             *out = ast.AstBinding { name: name, index: i as u32, offset: fns[i].name.offset, kind: ast.AstBindingKind.Function }
             return true
         }
     }
-    var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+    var structs = tree.structs.as_slice()
     for var i: i64 = 0; i < len(structs); i += 1 {
         if structs[i].module == mod_idx && (!only_pub || structs[i].public) && str.equals(span_text(tree, structs[i].name), name) {
             *out = ast.AstBinding { name: name, index: i as u32, offset: structs[i].name.offset, kind: ast.AstBindingKind.Struct }
             return true
         }
     }
-    var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+    var enums = tree.enums.as_slice()
     for var i: i64 = 0; i < len(enums); i += 1 {
         if enums[i].module == mod_idx && (!only_pub || enums[i].public) && str.equals(span_text(tree, enums[i].name), name) {
             *out = ast.AstBinding { name: name, index: i as u32, offset: enums[i].name.offset, kind: ast.AstBindingKind.Enum }
             return true
         }
     }
-    var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+    var consts = tree.consts.as_slice()
     for var i: i64 = 0; i < len(consts); i += 1 {
         if !consts[i].local && consts[i].module == mod_idx && (!only_pub || consts[i].public) && str.equals(span_text(tree, consts[i].name), name) {
             *out = ast.AstBinding { name: name, index: i as u32, offset: consts[i].name.offset, kind: ast.AstBindingKind.Const }
@@ -488,8 +492,8 @@ fun resolve_symbol_binding(prog: *modules.ModuleProgram, word: []u8, prefix: []u
 }
 
 fun find_enclosing_fn(tree: *ast.Ast, off: u32): i64 {
-    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var fns = tree.functions.as_slice()
+    var nodes = tree.nodes.as_slice()
     for var i: i64 = 0; i < len(fns); i += 1 {
         if fns[i].module != 0 || fns[i].body == ast.NODE_NONE {
             continue
@@ -525,19 +529,19 @@ fun block_end_offset(src: []u8, open_pos: u32): u32 {
 fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
                           out_names: *vec.Vec[[]u8], out_offsets: *vec.Vec[u32], out_nodes: *vec.Vec[u32]) {
     var fdecl = tree.functions.data[fn_idx]
-    var children = vec.as_slice.[u32](&tree.children)
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var children = tree.children.as_slice()
+    var nodes = tree.nodes.as_slice()
     for var i: u32 = 0; i < fdecl.parameters.count; i += 1 {
         var pid = children[(fdecl.parameters.first + i) as i64]
         var pn = nodes[pid as i64]
         var pname = span_text(tree, ast.Span { offset: pn.pos, length: pn.a })
-        vec.push_value.[[]u8](out_names, pname)
-        vec.push_value.[u32](out_offsets, pn.pos)
-        vec.push_value.[u32](out_nodes, pid)
+        out_names.push_value(pname)
+        out_offsets.push_value(pn.pos)
+        out_nodes.push_value(pid)
     }
 
     // Walk AST nodes in the function; track block/loop end offsets so out-of-scope loop vars are excluded.
-    var vars = vec.as_slice.[ast.AstVariable](&tree.variables)
+    var vars = tree.variables.as_slice()
     var active_ends: [64]u32
     var active_depth: i32 = 0
     var fn_first = fdecl.nodes.first
@@ -573,9 +577,9 @@ fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
                 if cursor_off <= scope_end {
                     var v = vars[nd.a as i64]
                     var vname = span_text(tree, ast.Span { offset: nd.pos, length: v.name_length })
-                    vec.push_value.[[]u8](out_names, vname)
-                    vec.push_value.[u32](out_offsets, nd.pos)
-                    vec.push_value.[u32](out_nodes, nid)
+                    out_names.push_value(vname)
+                    out_offsets.push_value(nd.pos)
+                    out_nodes.push_value(nid)
                 }
             }
         }
@@ -587,9 +591,9 @@ fun find_local_at(tree: *ast.Ast, fn_idx: i64, cursor_off: u32, name: []u8,
     var names: vec.Vec[[]u8]
     var offsets: vec.Vec[u32]
     var nids: vec.Vec[u32]
-    vec.init.[[]u8](&names, tree.nodes.arena, 16)
-    vec.init.[u32](&offsets, tree.nodes.arena, 16)
-    vec.init.[u32](&nids, tree.nodes.arena, 16)
+    names.init(tree.nodes.arena, 16)
+    offsets.init(tree.nodes.arena, 16)
+    nids.init(tree.nodes.arena, 16)
     collect_in_scope_locals(tree, fn_idx, cursor_off, &names, &offsets, &nids)
     for var i = (names.len as i64) - 1; i >= 0; i -= 1 {
         if str.equals(names.data[i], name) {
@@ -616,7 +620,7 @@ fun find_member_node_at(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i
     }
     var tree = &prog.tree
     var fdecl = tree.functions.data[fn_idx]
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var nodes = tree.nodes.as_slice()
     var fn_first = fdecl.nodes.first
     var fn_end = fn_first + fdecl.nodes.count
     for var nid = fn_first; nid < fn_end; nid += 1 {
@@ -638,6 +642,17 @@ fun find_member_node_at(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i
     return false
 }
 
+fun find_struct_method(tree: *ast.Ast, struct_decl: u32, method_name: []const u8, out_fn_idx: *u32): bool {
+    var fns = tree.functions.as_slice()
+    for var i: i64 = 0; i < len(fns); i += 1 {
+        if fns[i].owner_struct == struct_decl && str.equals(span_text(tree, fns[i].name), method_name) {
+            *out_fn_idx = i as u32
+            return true
+        }
+    }
+    return false
+}
+
 fun find_struct_field(tree: *ast.Ast, sem: *sema.Sema, st: sema.SemaType, field_name: []u8,
                       out_off: *u32, out_type: *sema.SemaType): bool {
     if st.kind != sema.TypeKind.Struct || (st.record as u64) >= sem.records.len {
@@ -645,8 +660,8 @@ fun find_struct_field(tree: *ast.Ast, sem: *sema.Sema, st: sema.SemaType, field_
     }
     var sr = &sem.records.data[st.record as i64]
     var sdecl = tree.structs.data[sr.declaration as i64]
-    var children = vec.as_slice.[u32](&tree.children)
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var children = tree.children.as_slice()
+    var nodes = tree.nodes.as_slice()
     for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
         var fid = children[(sdecl.fields.first + i) as i64]
         var fn_node = nodes[fid as i64]
@@ -726,7 +741,7 @@ fun resolve_import_at_cursor(arena: *mem.Arena, ws: *Workspace, doc: *Document,
 }
 
 pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[DocSymbol]): bool {
-    if vec.init.[DocSymbol](out_syms, arena, 16) < 0 {
+    if out_syms.init(arena, 16) < 0 {
         return false
     }
     var tree: ast.Ast
@@ -739,19 +754,21 @@ pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[D
     if !parser.parse_append(arena, &tree, clean, 0, 0, &decls, &perr) {
         return true
     }
-    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+    var fns = tree.functions.as_slice()
     for var i: i64 = 0; i < len(fns); i += 1 {
         var pos = ast.offset_to_pos(clean, fns[i].name.offset)
+        var skind: i64 = 12
+        if fns[i].owner_struct != (~0 as u32) { skind = 6 }
         var sym = DocSymbol {
             name: span_text(&tree, fns[i].name),
-            kind: 12,
+            kind: skind,
             line: pos.line - 1,
             col: pos.col - 1,
             end_col: (pos.col - 1) + (fns[i].name.length as u64),
         }
-        vec.push.[DocSymbol](out_syms, &sym)
+        out_syms.push(&sym)
     }
-    var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+    var structs = tree.structs.as_slice()
     for var i: i64 = 0; i < len(structs); i += 1 {
         var pos = ast.offset_to_pos(clean, structs[i].name.offset)
         var sym = DocSymbol {
@@ -761,9 +778,9 @@ pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[D
             col: pos.col - 1,
             end_col: (pos.col - 1) + (structs[i].name.length as u64),
         }
-        vec.push.[DocSymbol](out_syms, &sym)
+        out_syms.push(&sym)
     }
-    var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+    var enums = tree.enums.as_slice()
     for var i: i64 = 0; i < len(enums); i += 1 {
         var pos = ast.offset_to_pos(clean, enums[i].name.offset)
         var sym = DocSymbol {
@@ -773,9 +790,9 @@ pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[D
             col: pos.col - 1,
             end_col: (pos.col - 1) + (enums[i].name.length as u64),
         }
-        vec.push.[DocSymbol](out_syms, &sym)
+        out_syms.push(&sym)
     }
-    var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+    var consts = tree.consts.as_slice()
     for var i: i64 = 0; i < len(consts); i += 1 {
         if consts[i].local { continue }
         var pos = ast.offset_to_pos(clean, consts[i].name.offset)
@@ -786,7 +803,7 @@ pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[D
             col: pos.col - 1,
             end_col: (pos.col - 1) + (consts[i].name.length as u64),
         }
-        vec.push.[DocSymbol](out_syms, &sym)
+        out_syms.push(&sym)
     }
     return true
 }
@@ -817,6 +834,11 @@ pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
             var ftype: sema.SemaType
             if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
                 offset_to_lsp(arena, &prog, doc, foff, out_uri, out_line, out_col)
+                return true
+            }
+            var mfn: u32 = 0
+            if (st.record as u64) < sem.records.len && find_struct_method(&prog.tree, sem.records.data[st.record as i64].declaration, word, &mfn) {
+                offset_to_lsp(arena, &prog, doc, prog.tree.functions.data[mfn as i64].name.offset, out_uri, out_line, out_col)
                 return true
             }
         }
@@ -863,6 +885,12 @@ pub fun hover(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col
             var ftype: sema.SemaType
             if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
                 var desc = str.concat3(arena, word, ": ", format_type(arena, &sem, ftype, &prog.tree))
+                *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
+                return true
+            }
+            var mfn: u32 = 0
+            if (st.record as u64) < sem.records.len && find_struct_method(&prog.tree, sem.records.data[st.record as i64].declaration, word, &mfn) {
+                var desc = format_fn_sig(arena, &prog.tree, &sem, mfn)
                 *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
                 return true
             }
@@ -938,12 +966,12 @@ fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *vec.Vec[C
         if e.is_dir {
             if !str.equals(e.name, "platform") && !str.starts_with(e.name, ".") {
                 var item = CompletionItem { label: e.name, kind: 9, detail: "module" }
-                vec.push.[CompletionItem](out_items, &item)
+                out_items.push(&item)
             }
         } else if str.ends_with(e.name, ".lunso") {
             var stem = str.strip_suffix(e.name, ".lunso")
             var item = CompletionItem { label: stem, kind: 9, detail: "module" }
-            vec.push.[CompletionItem](out_items, &item)
+            out_items.push(&item)
         }
     }
 }
@@ -965,7 +993,7 @@ fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
     if last_dot < 0 {
         if len(ws.std_dir) > 0 {
             var std_item = CompletionItem { label: "std", kind: 9, detail: "standard library" }
-            vec.push.[CompletionItem](out_items, &std_item)
+            out_items.push(&std_item)
         }
         add_dir_completions(arena, path.dir_prefix(doc.path), out_items)
         if len(ws.root_path) > 0 {
@@ -1007,7 +1035,7 @@ fun find_expr_before_dot(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: 
     }
     var tree = &prog.tree
     var fdecl = tree.functions.data[fn_idx]
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    var nodes = tree.nodes.as_slice()
     var fn_first = fdecl.nodes.first
     var fn_end = fn_first + fdecl.nodes.count
 
@@ -1047,12 +1075,12 @@ fun push_completion(out_items: *vec.Vec[CompletionItem], prefix: []u8, item: Com
     if len(prefix) > 0 && !str.starts_with(item.label, prefix) {
         return
     }
-    vec.push.[CompletionItem](out_items, &item)
+    out_items.push(&item)
 }
 
 pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
                    out_items: *vec.Vec[CompletionItem]): bool {
-    if vec.init.[CompletionItem](out_items, arena, 32) < 0 {
+    if out_items.init(arena, 32) < 0 {
         return false
     }
     var local_off = ast.pos_to_offset(doc.text, line0 + 1, col0 + 1)
@@ -1066,7 +1094,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     var typed_prefix = src[pos..word_end]
 
     var raw_items: vec.Vec[CompletionItem]
-    vec.init.[CompletionItem](&raw_items, arena, 32)
+    raw_items.init(arena, 32)
     if complete_import_line(arena, ws, doc, local_off, local_off, &raw_items) {
         for var i: u64 = 0; i < raw_items.len; i += 1 {
             push_completion(out_items, typed_prefix, raw_items.data[i])
@@ -1098,28 +1126,28 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
             if find_binding(scope, mod_name, &mb) && mb.kind == ast.AstBindingKind.Module {
                 var target_mod = mb.index
                 var tree = &prog.tree
-                var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+                var fns = tree.functions.as_slice()
                 for var i: i64 = 0; i < len(fns); i += 1 {
-                    if fns[i].module == target_mod && fns[i].public {
+                    if fns[i].owner_struct == (~0 as u32) && fns[i].module == target_mod && fns[i].public {
                         var sig = format_fn_sig(arena, tree, &sem, i as u32)
                         push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig })
                     }
                 }
-                var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+                var structs = tree.structs.as_slice()
                 for var i: i64 = 0; i < len(structs); i += 1 {
                     if structs[i].module == target_mod && structs[i].public {
                         var sname = span_text(tree, structs[i].name)
                         push_completion(out_items, typed_prefix, CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) })
                     }
                 }
-                var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+                var enums = tree.enums.as_slice()
                 for var i: i64 = 0; i < len(enums); i += 1 {
                     if enums[i].module == target_mod && enums[i].public {
                         var ename = span_text(tree, enums[i].name)
                         push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
                     }
                 }
-                var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+                var consts = tree.consts.as_slice()
                 for var i: i64 = 0; i < len(consts); i += 1 {
                     if !consts[i].local && consts[i].module == target_mod && consts[i].public {
                         push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) })
@@ -1136,8 +1164,8 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
             if find_expr_before_dot(&prog, &sem, fn_idx, dot_off, &st) && (st.record as u64) < sem.records.len {
                 var sr = &sem.records.data[st.record as i64]
                 var sdecl = prog.tree.structs.data[sr.declaration as i64]
-                var children = vec.as_slice.[u32](&prog.tree.children)
-                var nodes = vec.as_slice.[ast.AstNode](&prog.tree.nodes)
+                var children = prog.tree.children.as_slice()
+                var nodes = prog.tree.nodes.as_slice()
                 for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
                     var fid = children[(sdecl.fields.first + i) as i64]
                     var fn_node = nodes[fid as i64]
@@ -1147,6 +1175,13 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
                         det = str.concat3(arena, fname, ": ", format_type(arena, &sem, sr.fields.data[i as i64].type_info, &prog.tree))
                     }
                     push_completion(out_items, typed_prefix, CompletionItem { label: fname, kind: 5, detail: det })
+                }
+                var fns = prog.tree.functions.as_slice()
+                for var i: i64 = 0; i < len(fns); i += 1 {
+                    if fns[i].owner_struct == sr.declaration && (fns[i].public || fns[i].module == 0) {
+                        var sig = format_fn_sig(arena, &prog.tree, &sem, i as u32)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: span_text(&prog.tree, fns[i].name), kind: 2, detail: sig })
+                    }
                 }
             }
         }
@@ -1159,43 +1194,43 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         var lnames: vec.Vec[[]u8]
         var loffs: vec.Vec[u32]
         var lnids: vec.Vec[u32]
-        vec.init.[[]u8](&lnames, arena, 16)
-        vec.init.[u32](&loffs, arena, 16)
-        vec.init.[u32](&lnids, arena, 16)
+        lnames.init(arena, 16)
+        loffs.init(arena, 16)
+        lnids.init(arena, 16)
         collect_in_scope_locals(tree, fn_idx, local_off, &lnames, &loffs, &lnids)
         for var i: u64 = 0; i < lnames.len; i += 1 {
             push_completion(out_items, typed_prefix, CompletionItem { label: lnames.data[i], kind: 6, detail: "" })
         }
     }
 
-    var fns = vec.as_slice.[ast.AstFunction](&tree.functions)
+    var fns = tree.functions.as_slice()
     for var i: i64 = 0; i < len(fns); i += 1 {
-        if fns[i].module == 0 {
+        if fns[i].owner_struct == (~0 as u32) && fns[i].module == 0 {
             var sig = format_fn_sig(arena, tree, &sem, i as u32)
             push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, fns[i].name), kind: 3, detail: sig })
         }
     }
-    var structs = vec.as_slice.[ast.AstStruct](&tree.structs)
+    var structs = tree.structs.as_slice()
     for var i: i64 = 0; i < len(structs); i += 1 {
         if structs[i].module == 0 {
             var sname = span_text(tree, structs[i].name)
             push_completion(out_items, typed_prefix, CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) })
         }
     }
-    var enums = vec.as_slice.[ast.AstEnum](&tree.enums)
+    var enums = tree.enums.as_slice()
     for var i: i64 = 0; i < len(enums); i += 1 {
         if enums[i].module == 0 {
             var ename = span_text(tree, enums[i].name)
             push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
         }
     }
-    var consts = vec.as_slice.[ast.AstConst](&tree.consts)
+    var consts = tree.consts.as_slice()
     for var i: i64 = 0; i < len(consts); i += 1 {
         if !consts[i].local && consts[i].module == 0 {
             push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) })
         }
     }
-    var bs = vec.as_slice.[ast.AstBinding](&scope.bindings)
+    var bs = scope.bindings.as_slice()
     for var i: i64 = 0; i < len(bs); i += 1 {
         var det: []u8 = ""
         if bs[i].kind == ast.AstBindingKind.Function && (bs[i].index as u64) < tree.functions.len {
@@ -1287,23 +1322,23 @@ fun find_enclosing_brace_struct(src: []u8, pos: i64, out_word: *[]u8, out_prefix
 fun build_struct_signature(arena: *mem.Arena, tree: *ast.Ast, sdecl: ast.AstStruct,
                            word: []u8, out: *SignatureHelpInfo, active: i64) {
     var buf: vec.Vec[u8]
-    vec.init.[u8](&buf, arena, 128)
-    vec.append_slice.[u8](&buf, "struct ")
-    vec.append_slice.[u8](&buf, word)
-    vec.append_slice.[u8](&buf, " { ")
-    vec.init.[[]u8](&out.params, arena, 8)
-    var children = vec.as_slice.[u32](&tree.children)
-    var nodes = vec.as_slice.[ast.AstNode](&tree.nodes)
+    buf.init(arena, 128)
+    buf.append_slice("struct ")
+    buf.append_slice(word)
+    buf.append_slice(" { ")
+    out.params.init(arena, 8)
+    var children = tree.children.as_slice()
+    var nodes = tree.nodes.as_slice()
     for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
-        if i > 0 { vec.append_slice.[u8](&buf, ", ") }
+        if i > 0 { buf.append_slice(", ") }
         var fid = children[(sdecl.fields.first + i) as i64]
         var fnode = nodes[fid as i64]
         var fline = line_slice_at(tree.source, fnode.pos)
-        vec.append_slice.[u8](&buf, fline)
-        vec.push_value.[[]u8](&out.params, fline)
+        buf.append_slice(fline)
+        out.params.push_value(fline)
     }
-    vec.append_slice.[u8](&buf, " }")
-    out.label = vec.as_slice.[u8](&buf)
+    buf.append_slice(" }")
+    out.label = buf.as_slice()
     out.active_param = active
 }
 
@@ -1401,15 +1436,31 @@ pub fun signature_help(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0:
         return false
     }
 
+    var fn_target: u32 = ~0 as u32
     var b: ast.AstBinding
-    if !resolve_symbol_binding(&prog, word, prefix, &b) || b.kind != ast.AstBindingKind.Function {
+    if resolve_symbol_binding(&prog, word, prefix, &b) && b.kind == ast.AstBindingKind.Function {
+        fn_target = b.index
+    } else {
+        var wstart = cend
+        for wstart > 0 && is_ident_char(src[wstart - 1]) {
+            wstart -= 1
+        }
+        if wstart > 0 && src[wstart - 1] == '.' {
+            var fn_idx = find_enclosing_fn(&prog.tree, local_off)
+            var st: sema.SemaType
+            if find_expr_before_dot(&prog, &sem, fn_idx, (wstart - 1) as u32, &st) && (st.record as u64) < sem.records.len {
+                find_struct_method(&prog.tree, sem.records.data[st.record as i64].declaration, word, &fn_target)
+            }
+        }
+    }
+    if fn_target == (~0 as u32) {
         return false
     }
     var tree = &prog.tree
-    var fdecl = tree.functions.data[b.index as i64]
-    out.label = format_fn_sig(arena, tree, &sem, b.index)
+    var fdecl = tree.functions.data[fn_target as i64]
+    out.label = format_fn_sig(arena, tree, &sem, fn_target)
     out.active_param = commas
-    vec.init.[[]u8](&out.params, arena, 8)
+    out.params.init(arena, 8)
 
     var lparen = str.index_of(out.label, '(')
     var rparen = str.last_index_of(out.label, ')')
@@ -1425,7 +1476,11 @@ pub fun signature_help(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0:
             if k == len(inner) || (inner[k] == ',' && bdepth == 0) {
                 var pstr = str.trim(inner[pstart..k])
                 if len(pstr) > 0 {
-                    vec.push_value.[[]u8](&out.params, pstr)
+                    if fdecl.owner_struct != (~0 as u32) && pstart == 0 {
+                        // Skip implicit self parameter for struct method calls.
+                    } else {
+                        out.params.push_value(pstr)
+                    }
                 }
                 pstart = k + 1
             }

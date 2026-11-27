@@ -213,7 +213,7 @@ class TestLunsoLsp(unittest.TestCase):
             })
             comp_vec_items = read_msg(proc.stdout)["result"]
             comp_vec_map = {item["label"]: item.get("detail") for item in comp_vec_items}
-            self.assertEqual(set(comp_vec_map.keys()), {"data", "len", "cap", "arena"})
+            self.assertTrue({"data", "len", "cap", "arena", "push", "push_value", "as_slice", "as_const_slice"}.issubset(set(comp_vec_map.keys())))
             self.assertEqual(comp_vec_map["data"], "data: *Inner")
 
             send({

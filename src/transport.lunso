@@ -43,7 +43,7 @@ pub fun read_message(arena: *mem.Arena, out: *[]u8): i32 {
     }
 
     var body_ptr: *u8
-    if mem.alloc(arena, content_len, 1, &body_ptr) < 0 {
+    if arena.alloc(content_len, 1, &body_ptr) < 0 {
         return -1
     }
     var got = io.read_exact(body_ptr, content_len)

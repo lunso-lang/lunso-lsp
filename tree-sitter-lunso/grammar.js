@@ -139,7 +139,7 @@ module.exports = grammar({
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameter_list)),
       '{',
-      repeat(seq($.field_declaration, optional(';'))),
+      repeat(choice($.function_declaration, $.extern_function_declaration, seq($.field_declaration, optional(';')))),
       '}',
     ),
 
@@ -193,7 +193,7 @@ module.exports = grammar({
 
     pointer_type: $ => seq('*', optional('const'), $._type),
     array_type: $ => seq('[', choice($.integer_literal, $.identifier), ']', $._type),
-    slice_type: $ => seq('[', ']', $._type),
+    slice_type: $ => seq('[', ']', optional('const'), $._type),
     qualified_type: $ => prec(1, seq($.identifier, repeat1(seq('.', $.identifier)))),
     generic_type: $ => prec(2, seq(
       choice($.qualified_type, alias($.identifier, $.type_identifier)),
@@ -215,6 +215,7 @@ module.exports = grammar({
       $.for_statement,
       $.break_statement,
       $.continue_statement,
+      $.defer_statement,
       $._expression,
     ),
 
@@ -226,6 +227,8 @@ module.exports = grammar({
     ),
 
     return_statement: $ => prec.right(seq('return', optional($._expression))),
+
+    defer_statement: $ => prec.right(seq('defer', choice($.block, $._statement))),
 
     if_statement: $ => prec.right(seq(
       'if',
