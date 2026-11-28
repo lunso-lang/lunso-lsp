@@ -15,6 +15,10 @@
   "enum" @context
   name: (identifier) @name) @item
 
+(trait_declaration
+  "trait" @context
+  name: (identifier) @name) @item
+
 (const_declaration
   "const" @context
   name: (identifier) @name) @item

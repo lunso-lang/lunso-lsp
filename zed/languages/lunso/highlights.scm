@@ -4,6 +4,7 @@
   "ext"
   "struct"
   "enum"
+  "trait"
   "const"
   "import"
   "var"
@@ -26,12 +27,14 @@
 (type_identifier) @type
 (struct_declaration name: (identifier) @type)
 (enum_declaration name: (identifier) @type)
+(trait_declaration name: (identifier) @type)
 (struct_literal type: (identifier) @type)
 (struct_literal type: (member_expression member: (identifier) @type))
 
 ; Functions
 (function_declaration name: (identifier) @function)
 (extern_function_declaration name: (identifier) @function)
+(trait_method name: (identifier) @function)
 (call_expression function: (identifier) @function)
 (call_expression function: (member_expression member: (identifier) @function.method))
 (call_expression function: (generic_expression function: (identifier) @function))

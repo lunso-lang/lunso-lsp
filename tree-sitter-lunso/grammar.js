@@ -47,6 +47,7 @@ module.exports = grammar({
       $.extern_function_declaration,
       $.struct_declaration,
       $.enum_declaration,
+      $.trait_declaration,
       $.const_declaration,
     ),
 
@@ -82,12 +83,27 @@ module.exports = grammar({
       optional(seq('as', field('alias', $.identifier))),
     ),
 
+    type_parameter: $ => seq(
+      field('name', alias($.identifier, $.type_identifier)),
+      optional(seq(':', $.trait_bound_list)),
+    ),
+
+    trait_bound_list: $ => seq(
+      alias($.identifier, $.type_identifier),
+      repeat(seq('+', alias($.identifier, $.type_identifier))),
+    ),
+
     type_parameter_list: $ => seq(
       '[',
-      alias($.identifier, $.type_identifier),
-      repeat(seq(',', alias($.identifier, $.type_identifier))),
+      $.type_parameter,
+      repeat(seq(',', $.type_parameter)),
       optional(','),
       ']',
+    ),
+
+    trait_list: $ => seq(
+      $._type,
+      repeat(seq(',', $._type)),
     ),
 
     type_argument_list: $ => seq(
@@ -140,6 +156,7 @@ module.exports = grammar({
       'struct',
       field('name', $.identifier),
       optional(field('type_parameters', $.type_parameter_list)),
+      optional(seq(':', $.trait_list)),
       '{',
       repeat(choice($.function_declaration, $.extern_function_declaration, seq($.field_declaration, optional(';')))),
       '}',
@@ -155,8 +172,8 @@ module.exports = grammar({
       optional($.visibility),
       'enum',
       field('name', $.identifier),
-      ':',
-      field('backing_type', $._type),
+      optional(field('type_parameters', $.type_parameter_list)),
+      optional(seq(':', $.trait_list)),
       '{',
       repeat(seq($.enum_member, optional(choice(',', ';')))),
       '}',
@@ -164,7 +181,26 @@ module.exports = grammar({
 
     enum_member: $ => seq(
       field('name', $.identifier),
-      optional(seq('=', optional('-'), choice($.integer_literal, $.char_literal))),
+      optional(choice(
+        seq('(', optional(seq($._type, repeat(seq(',', $._type)), optional(','))), ')'),
+        seq('=', optional('-'), choice($.integer_literal, $.char_literal)),
+      )),
+    ),
+
+    trait_declaration: $ => seq(
+      optional($.visibility),
+      'trait',
+      field('name', $.identifier),
+      '{',
+      repeat(seq($.trait_method, optional(';'))),
+      '}',
+    ),
+
+    trait_method: $ => seq(
+      'fun',
+      field('name', $.identifier),
+      field('parameters', $.parameter_list),
+      optional(seq(':', field('return_type', $._type))),
     ),
 
     const_declaration: $ => seq(

@@ -6,6 +6,7 @@ import std.os
 import std.path
 import std.str
 import frontend.ast
+import frontend.ast { AstData }
 import frontend.modules
 import frontend.parser
 import frontend.sema
@@ -309,6 +310,23 @@ fun word_at(src: []u8, off: u32, out_word: *[]u8, out_prefix: *[]u8): bool {
     return true
 }
 
+fun has_dot_before_word(src: []u8, off: u32): bool {
+    var n = len(src)
+    var pos = off as i64
+    if pos > n { pos = n }
+    if pos > 0 && (pos == n || !is_ident_char(src[pos])) && is_ident_char(src[pos - 1]) {
+        pos -= 1
+    }
+    if pos >= n || !is_ident_char(src[pos]) {
+        return false
+    }
+    var start = pos
+    for start > 0 && is_ident_char(src[start - 1]) {
+        start -= 1
+    }
+    return start >= 1 && src[start - 1] == '.'
+}
+
 fun span_text(tree: *ast.Ast, sp: ast.Span): []u8 {
     return tree.source[(sp.offset as i64)..((sp.offset + sp.length) as i64)]
 }
@@ -334,6 +352,9 @@ fun binding_decl_offset(tree: *ast.Ast, b: ast.AstBinding): u32 {
     if b.kind == ast.AstBindingKind.Enum {
         return tree.enums.data[b.index as i64].name.offset
     }
+    if b.kind == ast.AstBindingKind.Trait {
+        return tree.traits.data[b.index as i64].name.offset
+    }
     if b.kind == ast.AstBindingKind.Const {
         return tree.consts.data[b.index as i64].name.offset
     }
@@ -356,6 +377,15 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
     if t.kind == sema.TypeKind.Struct {
         var sr = sem.records.data[t.record as i64]
         var sp = tree.structs.data[sr.declaration as i64].name
+        return span_text(tree, sp)
+    }
+    if t.kind == sema.TypeKind.TaggedUnion && (t.record as u64) < sem.unions.len {
+        var su = sem.unions.data[t.record as i64]
+        var sp = tree.enums.data[su.declaration as i64].name
+        return span_text(tree, sp)
+    }
+    if sema.is_enum(t) {
+        var sp = tree.enums.data[(t.record - 1) as i64].name
         return span_text(tree, sp)
     }
     if t.kind == sema.TypeKind.Pointer {
@@ -436,7 +466,12 @@ fun format_fn_sig(arena: *mem.Arena, tree: *ast.Ast, sem: *sema.Sema, fn_idx: u3
         if i > 0 { buf.append_slice(", ") }
         var pid = children[(fdecl.parameters.first + i) as i64]
         var pn = nodes[pid as i64]
-        var pname = ast.Span { offset: pn.pos, length: pn.a }
+        var plen: u32 = 0
+        match pn.data {
+            AstData.Parameter(par) => plen = par.name_length
+            else => {}
+        }
+        var pname = ast.Span { offset: pn.pos, length: plen }
         buf.append_slice(span_text(tree, pname))
         buf.append_slice(": ")
         if (i as u64) < sf.param_types.len {
@@ -470,6 +505,13 @@ fun find_module_decl(tree: *ast.Ast, mod_idx: u32, name: []u8, only_pub: bool, o
     for var i: i64 = 0; i < len(enums); i += 1 {
         if enums[i].module == mod_idx && (!only_pub || enums[i].public) && str.equals(span_text(tree, enums[i].name), name) {
             *out = ast.AstBinding { name: name, index: i as u32, offset: enums[i].name.offset, kind: ast.AstBindingKind.Enum }
+            return true
+        }
+    }
+    var traits = tree.traits.as_slice()
+    for var i: i64 = 0; i < len(traits); i += 1 {
+        if traits[i].module == mod_idx && (!only_pub || traits[i].public) && str.equals(span_text(tree, traits[i].name), name) {
+            *out = ast.AstBinding { name: name, index: i as u32, offset: traits[i].name.offset, kind: ast.AstBindingKind.Trait }
             return true
         }
     }
@@ -545,81 +587,138 @@ fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
     for var i: u32 = 0; i < fdecl.parameters.count; i += 1 {
         var pid = children[(fdecl.parameters.first + i) as i64]
         var pn = nodes[pid as i64]
-        var pname = span_text(tree, ast.Span { offset: pn.pos, length: pn.a })
+        var plen: u32 = 0
+        match pn.data {
+            AstData.Parameter(par) => plen = par.name_length
+            else => {}
+        }
+        var pname = span_text(tree, ast.Span { offset: pn.pos, length: plen })
         out_names.push_value(pname)
         out_offsets.push_value(pn.pos)
         out_nodes.push_value(pid)
     }
 
     // Walk AST nodes in the function; track block/loop end offsets so out-of-scope loop vars are excluded.
-    var vars = tree.variables.as_slice()
     var active_ends: [64]u32
     var active_depth: i32 = 0
     var fn_first = fdecl.nodes.first
     var fn_end = fn_first + fdecl.nodes.count
     for var nid = fn_first; nid < fn_end; nid += 1 {
         var nd = nodes[nid as i64]
-        if nd.kind == ast.AstKind.Block {
-            var bend = block_end_offset(tree.source, nd.pos)
-            if cursor_off >= nd.pos && cursor_off <= bend && active_depth < 64 {
-                active_ends[active_depth] = bend
-                active_depth += 1
+        match nd.data {
+            AstData.Block(_) => {
+                var bend = block_end_offset(tree.source, nd.pos)
+                if cursor_off >= nd.pos && cursor_off <= bend && active_depth < 64 {
+                    active_ends[active_depth] = bend
+                    active_depth += 1
+                }
             }
-        } else if nd.kind == ast.AstKind.Var {
-            if nd.pos <= cursor_off {
-                // Check if var is inside a block/loop that already closed before cursor_off.
-                var scope_end: u32 = ~0 as u32
-                for var b = fn_first; b < fn_end; b += 1 {
-                    var bn = nodes[b as i64]
-                    if bn.kind == ast.AstKind.Block || bn.kind == ast.AstKind.For || bn.kind == ast.AstKind.ForCStyle {
+            AstData.Var(v) => {
+                if nd.pos <= cursor_off {
+                    // Check if var is inside a block/loop that already closed before cursor_off.
+                    var scope_end: u32 = ~0 as u32
+                    for var b = fn_first; b < fn_end; b += 1 {
+                        var bn = nodes[b as i64]
+                        var is_scope = false
                         var bopen = bn.pos
-                        if bn.kind == ast.AstKind.For || bn.kind == ast.AstKind.ForCStyle {
-                            var body_id = bn.b
-                            if body_id != ast.NODE_NONE {
-                                bopen = nodes[body_id as i64].pos
+                        match bn.data {
+                            AstData.Block(_) => is_scope = true
+                            AstData.For(fh) => {
+                                is_scope = true
+                                if fh.body != ast.NODE_NONE {
+                                    bopen = nodes[fh.body as i64].pos
+                                }
+                            }
+                            AstData.ForIn(fih) => {
+                                is_scope = true
+                                if fih.body != ast.NODE_NONE {
+                                    bopen = nodes[fih.body as i64].pos
+                                }
+                            }
+                            else => {}
+                        }
+                        if is_scope {
+                            var bend = block_end_offset(tree.source, bopen)
+                            if nd.pos >= bn.pos && nd.pos <= bend && bend < scope_end {
+                                scope_end = bend
                             }
                         }
-                        var bend = block_end_offset(tree.source, bopen)
-                        if nd.pos >= bn.pos && nd.pos <= bend && bend < scope_end {
-                            scope_end = bend
-                        }
+                    }
+                    if cursor_off <= scope_end {
+                        var vname = span_text(tree, ast.Span { offset: nd.pos, length: v.name_length })
+                        out_names.push_value(vname)
+                        out_offsets.push_value(nd.pos)
+                        out_nodes.push_value(nid)
                     }
                 }
-                if cursor_off <= scope_end {
-                    var v = vars[nd.a as i64]
-                    var vname = span_text(tree, ast.Span { offset: nd.pos, length: v.name_length })
-                    out_names.push_value(vname)
-                    out_offsets.push_value(nd.pos)
-                    out_nodes.push_value(nid)
-                }
             }
-        } else if nd.kind == ast.AstKind.ForIn {
-            var h = tree.for_in_headers.data[nd.a as i64]
-            var bopen = nodes[nd.b as i64].pos
-            var bend = block_end_offset(tree.source, bopen)
-            if cursor_off >= bopen && cursor_off <= bend {
-                if h.index_name.length > 0 && !str.equals(span_text(tree, h.index_name), "_") {
-                    out_names.push_value(span_text(tree, h.index_name))
-                    out_offsets.push_value(h.index_name.offset)
-                    out_nodes.push_value(nid)
-                }
-                if !str.equals(span_text(tree, h.item_name), "_") {
-                    out_names.push_value(span_text(tree, h.item_name))
-                    out_offsets.push_value(h.item_name.offset)
-                    out_nodes.push_value(nid)
-                }
-            }
-        } else if nd.kind == ast.AstKind.OrElse {
-            var h = tree.or_elses.data[nd.a as i64]
-            if h.is_block && h.err_name.length > 0 {
-                var bopen = nodes[h.handler as i64].pos
+            AstData.ForIn(h) => {
+                var bopen = nodes[h.body as i64].pos
                 var bend = block_end_offset(tree.source, bopen)
                 if cursor_off >= bopen && cursor_off <= bend {
-                    out_names.push_value(span_text(tree, h.err_name))
-                    out_offsets.push_value(h.err_name.offset)
-                    out_nodes.push_value(nid)
+                    if h.index_name.length > 0 && !str.equals(span_text(tree, h.index_name), "_") {
+                        out_names.push_value(span_text(tree, h.index_name))
+                        out_offsets.push_value(h.index_name.offset)
+                        out_nodes.push_value(nid)
+                    }
+                    if !str.equals(span_text(tree, h.item_name), "_") {
+                        out_names.push_value(span_text(tree, h.item_name))
+                        out_offsets.push_value(h.item_name.offset)
+                        out_nodes.push_value(nid)
+                    }
                 }
             }
+            AstData.OrElse(h) => {
+                if h.is_block && h.err_name.length > 0 {
+                    var bopen = nodes[h.handler as i64].pos
+                    var bend = block_end_offset(tree.source, bopen)
+                    if cursor_off >= bopen && cursor_off <= bend {
+                        out_names.push_value(span_text(tree, h.err_name))
+                        out_offsets.push_value(h.err_name.offset)
+                        out_nodes.push_value(nid)
+                    }
+                }
+            }
+            AstData.Match(mr) => {
+                for var ai: u32 = 1; ai < mr.count; ai += 1 {
+                    var arm_id = children[(mr.first + ai) as i64]
+                    match nodes[arm_id as i64].data {
+                        AstData.MatchArm(ar) => {
+                            if ar.count >= 2 {
+                                var body_id = children[(ar.first + ar.count - 1) as i64]
+                                var bopen = nodes[body_id as i64].pos
+                                var bend = block_end_offset(tree.source, bopen)
+                                if cursor_off >= bopen && cursor_off <= bend {
+                                    for var p: u32 = 0; p < ar.count - 1; p += 1 {
+                                        var pat_id = children[(ar.first + p) as i64]
+                                        match nodes[pat_id as i64].data {
+                                            AstData.Call(pcr) => {
+                                                for var bi: u32 = 1; bi < pcr.count; bi += 1 {
+                                                    var arg_id = children[(pcr.first + bi) as i64]
+                                                    match nodes[arg_id as i64].data {
+                                                        AstData.Identifier(blen) => {
+                                                            var bname = span_text(tree, ast.Span { offset: nodes[arg_id as i64].pos, length: blen })
+                                                            if !str.equals(bname, "_") {
+                                                                out_names.push_value(bname)
+                                                                out_offsets.push_value(nodes[arg_id as i64].pos)
+                                                                out_nodes.push_value(arg_id)
+                                                            }
+                                                        }
+                                                        else => {}
+                                                    }
+                                                }
+                                            }
+                                            else => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        else => {}
+                    }
+                }
+            }
+            else => {}
         }
     }
 }
@@ -644,16 +743,29 @@ fun find_local_at(tree: *ast.Ast, fn_idx: i64, cursor_off: u32, name: []u8,
 }
 
 fun sema_node_at(sem: *sema.Sema, fn_idx: i64, fn_first: u32, nid: u32): *sema.SemaNode {
-    var sf = &sem.functions.data[fn_idx]
-    if sf.nodes.len > 0 {
-        return &sf.nodes.data[(nid - fn_first) as i64]
+    if fn_idx >= 0 && (fn_idx as u64) < sem.functions.len {
+        var sf = &sem.functions.data[fn_idx]
+        if sf.nodes.len > 0 && ((nid - fn_first) as u64) < sf.nodes.len {
+            return &sf.nodes.data[(nid - fn_first) as i64]
+        }
+        var sn = &sem.nodes.data[nid as i64]
+        if sn.type_info.kind == sema.TypeKind.Invalid {
+            for var i: i64 = 0; i < (sem.functions.len as i64); i += 1 {
+                var inst = &sem.functions.data[i]
+                if inst.declaration == (fn_idx as u32) && ((nid - fn_first) as u64) < inst.nodes.len {
+                    return &inst.nodes.data[(nid - fn_first) as i64]
+                }
+            }
+        }
+        return sn
     }
     return &sem.nodes.data[nid as i64]
 }
 
 fun find_member_node_at(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i64,
-                        cursor_off: u32, word: []u8, out_struct_type: *sema.SemaType): bool {
-    if fn_idx < 0 || (fn_idx as u64) >= sem.functions.len {
+                        cursor_off: u32, word: []u8, out_struct_type: *sema.SemaType,
+                        out_struct_decl: *u32): bool {
+    if fn_idx < 0 || (fn_idx as u64) >= prog.tree.functions.len {
         return false
     }
     var tree = &prog.tree
@@ -663,18 +775,57 @@ fun find_member_node_at(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: i
     var fn_end = fn_first + fdecl.nodes.count
     for var nid = fn_first; nid < fn_end; nid += 1 {
         var nd = nodes[nid as i64]
-        if nd.kind == ast.AstKind.Member && nd.pos <= cursor_off && cursor_off <= nd.pos + nd.b {
-            var mname = span_text(tree, ast.Span { offset: nd.pos, length: nd.b })
-            if str.equals(mname, word) && (nd.a >= fn_first && nd.a < fn_end) {
-                var bt = sema_node_at(sem, fn_idx, fn_first, nd.a).type_info
-                if bt.kind == sema.TypeKind.Pointer {
-                    bt = sem.pointees.data[bt.pointee as i64]
-                }
-                if bt.kind == sema.TypeKind.Struct {
-                    *out_struct_type = bt
-                    return true
+        match nd.data {
+            AstData.Member(m) => {
+                if nd.pos <= cursor_off && cursor_off <= nd.pos + m.name_length {
+                    var mname = span_text(tree, ast.Span { offset: nd.pos, length: m.name_length })
+                    if str.equals(mname, word) && (m.base >= fn_first && m.base < fn_end) {
+                        var bt = sema_node_at(sem, fn_idx, fn_first, m.base).type_info
+                        if bt.kind == sema.TypeKind.Pointer {
+                            bt = sem.pointees.data[bt.pointee as i64]
+                        }
+                        if bt.kind == sema.TypeKind.Struct && (bt.record as u64) < sem.records.len {
+                            *out_struct_type = bt
+                            *out_struct_decl = sem.records.data[bt.record as i64].declaration
+                            return true
+                        }
+                        if fdecl.owner_struct != (~0 as u32) {
+                            match nodes[m.base as i64].data {
+                                AstData.Identifier(blen) => {
+                                    if str.equals(span_text(tree, ast.Span { offset: nodes[m.base as i64].pos, length: blen }), "self") {
+                                        *out_struct_type = sema.empty_type()
+                                        *out_struct_decl = fdecl.owner_struct
+                                        return true
+                                    }
+                                }
+                                else => {}
+                            }
+                        }
+                    }
                 }
             }
+            else => {}
+        }
+    }
+    return false
+}
+
+fun find_enum_case(tree: *ast.Ast, enum_idx: u32, case_name: []u8, out_off: *u32): bool {
+    if (enum_idx as u64) >= tree.enums.len { return false }
+    var edecl = tree.enums.data[enum_idx as i64]
+    var children = tree.children.as_slice()
+    var nodes = tree.nodes.as_slice()
+    for var i: u32 = 0; i < edecl.cases.count; i += 1 {
+        var cid = children[(edecl.cases.first + i) as i64]
+        var cnode = nodes[cid as i64]
+        var clen: u32 = 0
+        match cnode.data {
+            AstData.EnumCase(ec) => clen = ec.name_length
+            else => {}
+        }
+        if str.equals(span_text(tree, ast.Span { offset: cnode.pos, length: clen }), case_name) {
+            *out_off = cnode.pos
+            return true
         }
     }
     return false
@@ -703,7 +854,12 @@ fun find_struct_field(tree: *ast.Ast, sem: *sema.Sema, st: sema.SemaType, field_
     for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
         var fid = children[(sdecl.fields.first + i) as i64]
         var fn_node = nodes[fid as i64]
-        var fname = span_text(tree, ast.Span { offset: fn_node.pos, length: fn_node.a })
+        var flen: u32 = 0
+        match fn_node.data {
+            AstData.Field(f) => flen = f.name_length
+            else => {}
+        }
+        var fname = span_text(tree, ast.Span { offset: fn_node.pos, length: flen })
         if str.equals(fname, field_name) {
             *out_off = fn_node.pos
             if (i as u64) < sr.fields.len {
@@ -828,6 +984,18 @@ pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *Vec[DocSy
         }
         out_syms.push(&sym)
     }
+    var traits = tree.traits.as_slice()
+    for var i: i64 = 0; i < len(traits); i += 1 {
+        var pos = ast.offset_to_pos(clean, traits[i].name.offset)
+        var sym = DocSymbol {
+            name: span_text(&tree, traits[i].name),
+            kind: 11,
+            line: pos.line - 1,
+            col: pos.col - 1,
+            end_col: (pos.col - 1) + (traits[i].name.length as u64),
+        }
+        out_syms.push(&sym)
+    }
     var consts = tree.consts.as_slice()
     for var i: i64 = 0; i < len(consts); i += 1 {
         if consts[i].local { continue }
@@ -863,20 +1031,31 @@ pub fun definition(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     }
     var fn_idx = find_enclosing_fn(&prog.tree, local_off)
 
-    if len(prefix) > 0 && ok && fn_idx >= 0 {
+    if has_dot_before_word(doc.text, local_off) && fn_idx >= 0 {
         var st: sema.SemaType
-        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st) {
+        var sdecl_idx: u32 = ~0 as u32
+        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st, &sdecl_idx) {
             var foff: u32 = 0
             var ftype: sema.SemaType
-            if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
+            if st.kind == sema.TypeKind.Struct && find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
                 offset_to_lsp(arena, &prog, doc, foff, out_uri, out_line, out_col)
                 return true
             }
             var mfn: u32 = 0
-            if (st.record as u64) < sem.records.len && find_struct_method(&prog.tree, sem.records.data[st.record as i64].declaration, word, &mfn) {
+            if sdecl_idx != (~0 as u32) && find_struct_method(&prog.tree, sdecl_idx, word, &mfn) {
                 offset_to_lsp(arena, &prog, doc, prog.tree.functions.data[mfn as i64].name.offset, out_uri, out_line, out_col)
                 return true
             }
+        }
+    }
+
+    if len(prefix) > 0 {
+        var eb: ast.AstBinding
+        var eoff: u32 = 0
+        if resolve_symbol_binding(&prog, prefix, "", &eb) && eb.kind == ast.AstBindingKind.Enum &&
+           find_enum_case(&prog.tree, eb.index, word, &eoff) {
+            offset_to_lsp(arena, &prog, doc, eoff, out_uri, out_line, out_col)
+            return true
         }
     }
 
@@ -914,22 +1093,34 @@ pub fun hover(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col
     }
     var fn_idx = find_enclosing_fn(&prog.tree, local_off)
 
-    if len(prefix) > 0 && ok && fn_idx >= 0 {
+    if has_dot_before_word(doc.text, local_off) && fn_idx >= 0 {
         var st: sema.SemaType
-        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st) {
+        var sdecl_idx: u32 = ~0 as u32
+        if find_member_node_at(&prog, &sem, fn_idx, local_off, word, &st, &sdecl_idx) {
             var foff: u32 = 0
             var ftype: sema.SemaType
-            if find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
+            if st.kind == sema.TypeKind.Struct && find_struct_field(&prog.tree, &sem, st, word, &foff, &ftype) {
                 var desc = str.concat3(arena, word, ": ", format_type(arena, &sem, ftype, &prog.tree))
                 *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
                 return true
             }
             var mfn: u32 = 0
-            if (st.record as u64) < sem.records.len && find_struct_method(&prog.tree, sem.records.data[st.record as i64].declaration, word, &mfn) {
+            if sdecl_idx != (~0 as u32) && find_struct_method(&prog.tree, sdecl_idx, word, &mfn) {
                 var desc = format_fn_sig(arena, &prog.tree, &sem, mfn)
                 *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
                 return true
             }
+        }
+    }
+
+    if len(prefix) > 0 {
+        var eb: ast.AstBinding
+        var eoff: u32 = 0
+        if resolve_symbol_binding(&prog, prefix, "", &eb) && eb.kind == ast.AstBindingKind.Enum &&
+           find_enum_case(&prog.tree, eb.index, word, &eoff) {
+            var desc = line_slice_at(prog.tree.source, eoff)
+            *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
+            return true
         }
     }
 
@@ -939,22 +1130,26 @@ pub fun hover(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col
         if find_local_at(&prog.tree, fn_idx, local_off, word, &loff, &lnid) {
             var nd = prog.tree.nodes.data[lnid as i64]
             var desc = word
-            if nd.kind == ast.AstKind.Var {
-                desc = line_slice_at(prog.tree.source, loff)
-                // Trim `for ` prefix if this is a C-style for loop initializer.
-                if str.starts_with(desc, "for ") {
-                    var semi = str.index_of(desc, ';')
-                    if semi >= 4 {
-                        desc = str.trim(desc[4..semi])
+            match nd.data {
+                AstData.Var(_) => {
+                    desc = line_slice_at(prog.tree.source, loff)
+                    // Trim `for ` prefix if this is a C-style for loop initializer.
+                    if str.starts_with(desc, "for ") {
+                        var semi = str.index_of(desc, ';')
+                        if semi >= 4 {
+                            desc = str.trim(desc[4..semi])
+                        }
                     }
                 }
-            } else if nd.kind == ast.AstKind.Parameter {
-                var rest = prog.tree.source[(loff as i64)..len(prog.tree.source)]
-                var p_end: i64 = 0
-                for p_end < len(rest) && rest[p_end] != ',' && rest[p_end] != ')' && rest[p_end] != '\n' {
-                    p_end += 1
+                AstData.Parameter(_) => {
+                    var rest = prog.tree.source[(loff as i64)..len(prog.tree.source)]
+                    var p_end: i64 = 0
+                    for p_end < len(rest) && rest[p_end] != ',' && rest[p_end] != ')' && rest[p_end] != '\n' {
+                        p_end += 1
+                    }
+                    desc = str.trim(rest[0..p_end])
                 }
-                desc = str.trim(rest[0..p_end])
+                else => {}
             }
             *out_md = str.concat3(arena, "```lunso\n", desc, "\n```")
             return true
@@ -974,6 +1169,8 @@ pub fun hover(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col
         desc = str.concat(arena, "struct ", word)
     } else if b.kind == ast.AstBindingKind.Enum {
         desc = str.concat(arena, "enum ", word)
+    } else if b.kind == ast.AstBindingKind.Trait {
+        desc = str.concat(arena, "trait ", word)
     } else if b.kind == ast.AstBindingKind.Const {
         desc = line_slice_at(prog.tree.source, binding_decl_offset(&prog.tree, b))
     } else if b.kind == ast.AstBindingKind.Module {
@@ -987,6 +1184,7 @@ fun binding_completion_kind(k: ast.AstBindingKind): i64 {
     if k == ast.AstBindingKind.Function { return 3 }
     if k == ast.AstBindingKind.Struct { return 22 }
     if k == ast.AstBindingKind.Enum { return 13 }
+    if k == ast.AstBindingKind.Trait { return 8 }
     if k == ast.AstBindingKind.Const { return 21 }
     return 9
 }
@@ -1086,7 +1284,14 @@ fun find_expr_before_dot(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: 
         if nd.pos < line_start || nd.pos >= dot_off {
             continue
         }
-        if nd.kind == ast.AstKind.Block || nd.kind == ast.AstKind.Var || nd.kind == ast.AstKind.Return {
+        var skip = false
+        match nd.data {
+            AstData.Block(_) => skip = true
+            AstData.Var(_) => skip = true
+            AstData.Return(_) => skip = true
+            else => {}
+        }
+        if skip {
             continue
         }
         var t = sema_node_at(sem, fn_idx, fn_first, nid).type_info
@@ -1183,11 +1388,37 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
                         push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
                     }
                 }
+                var traits = tree.traits.as_slice()
+                for var i: i64 = 0; i < len(traits); i += 1 {
+                    if traits[i].module == target_mod && traits[i].public {
+                        var tname = span_text(tree, traits[i].name)
+                        push_completion(out_items, typed_prefix, CompletionItem { label: tname, kind: 8, detail: str.concat(arena, "trait ", tname) })
+                    }
+                }
                 var consts = tree.consts.as_slice()
                 for var i: i64 = 0; i < len(consts); i += 1 {
                     if !consts[i].local && consts[i].module == target_mod && consts[i].public {
                         push_completion(out_items, typed_prefix, CompletionItem { label: span_text(tree, consts[i].name), kind: 21, detail: line_slice_at(tree.source, consts[i].name.offset) })
                     }
+                }
+                return true
+            }
+            var eb: ast.AstBinding
+            if resolve_symbol_binding(&prog, mod_name, "", &eb) && eb.kind == ast.AstBindingKind.Enum {
+                var tree = &prog.tree
+                var edecl = tree.enums.data[eb.index as i64]
+                var children = tree.children.as_slice()
+                var nodes = tree.nodes.as_slice()
+                for var i: u32 = 0; i < edecl.cases.count; i += 1 {
+                    var cid = children[(edecl.cases.first + i) as i64]
+                    var cnode = nodes[cid as i64]
+                    var clen: u32 = 0
+                    match cnode.data {
+                        AstData.EnumCase(ec) => clen = ec.name_length
+                        else => {}
+                    }
+                    var cname = span_text(tree, ast.Span { offset: cnode.pos, length: clen })
+                    push_completion(out_items, typed_prefix, CompletionItem { label: cname, kind: 20, detail: line_slice_at(tree.source, cnode.pos) })
                 }
                 return true
             }
@@ -1205,7 +1436,12 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
                 for var i: u32 = 0; i < sdecl.fields.count; i += 1 {
                     var fid = children[(sdecl.fields.first + i) as i64]
                     var fn_node = nodes[fid as i64]
-                    var fname = span_text(&prog.tree, ast.Span { offset: fn_node.pos, length: fn_node.a })
+                    var flen: u32 = 0
+                    match fn_node.data {
+                        AstData.Field(f) => flen = f.name_length
+                        else => {}
+                    }
+                    var fname = span_text(&prog.tree, ast.Span { offset: fn_node.pos, length: flen })
                     var det: []u8 = ""
                     if (i as u64) < sr.fields.len {
                         det = str.concat3(arena, fname, ": ", format_type(arena, &sem, sr.fields.data[i as i64].type_info, &prog.tree))
@@ -1260,6 +1496,13 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
             push_completion(out_items, typed_prefix, CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) })
         }
     }
+    var traits = tree.traits.as_slice()
+    for var i: i64 = 0; i < len(traits); i += 1 {
+        if traits[i].module == 0 {
+            var tname = span_text(tree, traits[i].name)
+            push_completion(out_items, typed_prefix, CompletionItem { label: tname, kind: 8, detail: str.concat(arena, "trait ", tname) })
+        }
+    }
     var consts = tree.consts.as_slice()
     for var i: i64 = 0; i < len(consts); i += 1 {
         if !consts[i].local && consts[i].module == 0 {
@@ -1279,12 +1522,12 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
         })
     }
 
-    var kws: [23][]u8 = [
-        "fun", "ext", "struct", "enum", "as", "const", "import", "pub", "priv",
+    var kws: [24][]u8 = [
+        "fun", "ext", "struct", "enum", "trait", "as", "const", "import", "pub", "priv",
         "return", "if", "else", "match", "for", "break", "continue", "defer", "var",
         "or", "any", "Self", "true", "false"
     ]
-    for var i: i64 = 0; i < 23; i += 1 {
+    for var i: i64 = 0; i < 24; i += 1 {
         push_completion(out_items, typed_prefix, CompletionItem { label: kws[i], kind: 14, detail: "keyword" })
     }
     return true

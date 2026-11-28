@@ -489,6 +489,104 @@ class TestLunsoLsp(unittest.TestCase):
             proc.stderr.close()
             self.assertEqual(proc.wait(timeout=5), 0)
 
+    def test_traits_and_tagged_unions(self) -> None:
+        env = os.environ.copy()
+        if LUNSO_BIN.exists():
+            env["LUNSO"] = str(LUNSO_BIN)
+        if STD_DIR.exists():
+            env["LUNSO_STD_DIR"] = str(STD_DIR)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workdir = Path(tmp)
+            doc_path = workdir / "features_06.lunso"
+            uri = doc_path.as_uri()
+            source = (
+                "import std.collections { HashMap }\n"
+                "import std.mem\n"
+                "pub trait Printable {\n"
+                "    fun print_me(v: i32)\n"
+                "}\n"
+                "enum Value : Eq, Hash {\n"
+                "    None,\n"
+                "    Int(i64),\n"
+                "}\n"
+                "fun eval_v(v: Value): i64 {\n"
+                "    match v {\n"
+                "        Value.None => return 0\n"
+                "        Value.Int(num) => {\n"
+                "            return num\n"
+                "        }\n"
+                "    }\n"
+                "}\n"
+                "fun main(): i32 {\n"
+                "    var a: mem.Arena\n"
+                "    a.init(4096)\n"
+                "    var m: HashMap[[]u8, Value]\n"
+                "    m.init(&a, 8)\n"
+                "    var v = Value.Int(42)\n"
+                "    var x = Value.\n"
+                "    return eval_v(v) as i32\n"
+                "}\n"
+            )
+            doc_path.write_text(source, encoding="utf-8")
+
+            proc = subprocess.Popen(
+                [str(LSP_BIN)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+            )
+            assert proc.stdin is not None and proc.stdout is not None
+
+            def send(msg: dict) -> None:
+                proc.stdin.write(encode_msg(msg))
+                proc.stdin.flush()
+
+            send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"rootUri": workdir.as_uri(), "capabilities": {}}})
+            _init = read_msg(proc.stdout)
+            send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+            send({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": {"uri": uri, "languageId": "lunso", "version": 1, "text": source}}})
+            _diag = read_msg(proc.stdout)
+
+            # documentSymbol includes trait Printable and enum Value
+            send({"jsonrpc": "2.0", "id": 2, "method": "textDocument/documentSymbol", "params": {"textDocument": {"uri": uri}}})
+            syms = {s["name"] for s in read_msg(proc.stdout)["result"]}
+            self.assertTrue({"Printable", "Value", "eval_v", "main"}.issubset(syms))
+
+            # Hover on Value.Int (line 22: `    var v = Value.Int(42)`)
+            send({"jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": {"textDocument": {"uri": uri}, "position": {"line": 22, "character": 18}}})
+            hv = read_msg(proc.stdout)["result"]
+            self.assertIn("Int(i64)", hv["contents"]["value"])
+
+            # Definition on Value.Int jumps to line 7
+            send({"jsonrpc": "2.0", "id": 4, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 22, "character": 18}}})
+            df = read_msg(proc.stdout)["result"]
+            self.assertEqual(df["range"]["start"]["line"], 7)
+
+            # Completion after `Value.` (line 23: `    var x = Value.`)
+            send({"jsonrpc": "2.0", "id": 5, "method": "textDocument/completion", "params": {"textDocument": {"uri": uri}, "position": {"line": 23, "character": 18}}})
+            comp = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertEqual(comp, {"None", "Int"})
+
+            # Definition on `num` inside match arm (line 13: `            return num`) jumps to line 12
+            send({"jsonrpc": "2.0", "id": 6, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 20}}})
+            df_num = read_msg(proc.stdout)["result"]
+            self.assertEqual(df_num["range"]["start"]["line"], 12)
+
+            # Definition on struct method call `m.init(&a, 8)` (line 21: `    m.init(&a, 8)`) jumps to std/collections.lunso
+            send({"jsonrpc": "2.0", "id": 8, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 21, "character": 7}}})
+            df_method = read_msg(proc.stdout)["result"]
+            self.assertTrue(df_method["uri"].endswith("/std/collections.lunso"))
+
+            send({"jsonrpc": "2.0", "id": 7, "method": "shutdown", "params": None})
+            self.assertIsNone(read_msg(proc.stdout)["result"])
+            send({"jsonrpc": "2.0", "method": "exit", "params": None})
+            proc.stdin.close()
+            proc.stdout.close()
+            proc.stderr.close()
+            self.assertEqual(proc.wait(timeout=5), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

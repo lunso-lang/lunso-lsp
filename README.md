@@ -1,6 +1,6 @@
 # lunso-lsp
 
-Language Server Protocol (LSP) server for the Lunso programming language, written in Lunso (`>= 0.3.1`).
+Language Server Protocol (LSP) server for the Lunso programming language, written in Lunso (`>= 0.6.2`).
 
 ## Features
 
