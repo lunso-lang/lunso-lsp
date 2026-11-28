@@ -8,7 +8,7 @@ repository = "https://github.com/Funcieq/lunso-lsp"
 
 [grammars.lunso]
 repository = "file:///home/funcieq/projects/lunso-lsp"
-rev = "2be2011141bc99f7ce859123037fa5338a09ac56"
+rev = "57415725aaf3a386157b6b3080b22b08f063d58c"
 path = "tree-sitter-lunso"
 
 [language_servers.lunso-lsp]
