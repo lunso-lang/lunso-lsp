@@ -1691,6 +1691,13 @@ fun find_enclosing_brace_struct(src: []u8, pos: i64, out_word: *[]u8, out_prefix
        str.equals(word, "match") || str.equals(word, "defer") {
         return false
     }
+    var line = line_slice_at(src, open_pos as u32)
+    if str.starts_with(line, "fun ") || str.starts_with(line, "pub fun ") || str.starts_with(line, "priv fun ") ||
+       str.starts_with(line, "struct ") || str.starts_with(line, "pub struct ") || str.starts_with(line, "priv struct ") ||
+       str.starts_with(line, "enum ") || str.starts_with(line, "pub enum ") || str.starts_with(line, "priv enum ") ||
+       str.starts_with(line, "trait ") || str.starts_with(line, "pub trait ") || str.starts_with(line, "priv trait ") {
+        return false
+    }
     *out_word = word
     *out_prefix = prefix
     *out_commas = commas
