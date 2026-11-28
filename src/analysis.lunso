@@ -130,6 +130,8 @@ fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *StrMap[[]u8]): bool 
 fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out: *Vec[[]u8]) {
     out.init(arena, 8)
     if len(ws.root_path) > 0 {
+        var src_dir = path.join(arena, ws.root_path, "src")
+        out.push_value(src_dir)
         out.push_value(ws.root_path)
     }
     var cur = path.dir_prefix(doc_path)
