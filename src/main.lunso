@@ -323,13 +323,61 @@ fun handle_signature_help(arena: *mem.Arena, ws: *analysis.Workspace, id: json.J
     transport.send_response(arena, id, res)
 }
 
-fun detect_std_dir(arena: *mem.Arena): []u8 {
+fun find_exe_dir(arena: *mem.Arena, bin_name: []u8): []u8 {
+    if len(bin_name) == 0 { return "" }
+    if str.index_of(bin_name, '/') >= 0 {
+        return path.dirname(bin_name)
+    }
+    var path_env: []u8
+    if os.getenv("PATH", arena, &path_env) != 0 || len(path_env) == 0 {
+        return ""
+    }
+    var n = len(path_env)
+    var start: i64 = 0
+    for var i: i64 = 0; i <= n; i += 1 {
+        if i == n || path_env[i] == ':' {
+            var dir = path_env[start..i]
+            if len(dir) > 0 && file.exists(path.join(arena, dir, bin_name)) {
+                return dir
+            }
+            start = i + 1
+        }
+    }
+    return ""
+}
+
+fun has_std_dir(arena: *mem.Arena, dir: []const u8): bool {
+    if len(dir) == 0 { return false }
+    return file.exists(path.join(arena, dir, "io.lunso"))
+}
+
+fun check_std_near(arena: *mem.Arena, exe_dir: []u8): []u8 {
+    if len(exe_dir) == 0 { return "" }
+    var c1 = path.join(arena, exe_dir, "std")
+    if has_std_dir(arena, c1) { return c1 }
+    var c2 = path.join(arena, exe_dir, "../std")
+    if has_std_dir(arena, c2) { return c2 }
+    return ""
+}
+
+fun detect_std_dir(arena: *mem.Arena, prog_name: []u8): []u8 {
     var env_val: []u8
     if os.getenv("LUNSO_STD_DIR", arena, &env_val) == 0 && len(env_val) > 0 {
         return env_val
     }
-    if file.exists("std/io.lunso") { return "std" }
-    if file.exists("../lunsoc/std/io.lunso") { return "../lunsoc/std" }
+    var self_std = check_std_near(arena, find_exe_dir(arena, prog_name))
+    if len(self_std) > 0 { return self_std }
+    var lunsoc_std = check_std_near(arena, find_exe_dir(arena, "lunsoc"))
+    if len(lunsoc_std) > 0 { return lunsoc_std }
+    if has_std_dir(arena, "std") { return "std" }
+    if has_std_dir(arena, "../lunsoc/std") { return "../lunsoc/std" }
+    var home: []u8
+    if os.getenv("HOME", arena, &home) == 0 && len(home) > 0 {
+        var h_std = path.join(arena, home, ".local/share/lunso/std")
+        if has_std_dir(arena, h_std) { return h_std }
+    }
+    if has_std_dir(arena, "/usr/local/share/lunso/std") { return "/usr/local/share/lunso/std" }
+    if has_std_dir(arena, "/usr/local/lib/lunso/std") { return "/usr/local/lib/lunso/std" }
     return ""
 }
 
@@ -340,10 +388,13 @@ fun main(): i32 {
     }
     defer analysis.workspace_deinit(&ws)
 
-    ws.std_dir = detect_std_dir(&ws.arena)
-
     var empty_args: [][]u8
     var cli_args = args.load(&ws.arena) or empty_args
+    var prog_name: []u8 = "lunso-lsp"
+    if len(cli_args) > 0 {
+        prog_name = cli_args[0]
+    }
+    ws.std_dir = detect_std_dir(&ws.arena, prog_name)
     for var i: i64 = 1; i + 1 < len(cli_args); i += 1 {
         if str.equals(cli_args[i], "--std") {
             ws.std_dir = cli_args[i + 1]
