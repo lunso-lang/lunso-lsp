@@ -1212,6 +1212,77 @@ fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *Vec[Compl
     }
 }
 
+fun add_module_file_symbols(arena: *mem.Arena, mod_file: []u8, include_star: bool, out_items: *Vec[CompletionItem]): bool {
+    if len(mod_file) == 0 || !file.exists(mod_file) {
+        return false
+    }
+    var src: []u8
+    if file.read_all(mod_file, arena, &src) < 0 {
+        return false
+    }
+    var tree: ast.Ast
+    if !ast.init(arena, src, &tree) {
+        return false
+    }
+    var decls: ast.NodeRange
+    var perr: parser.ParseError
+    if !parser.parse_append(arena, &tree, src, 0, 0, &decls, &perr) {
+        return false
+    }
+    if include_star {
+        var star = CompletionItem { label: "*", kind: 15, detail: "import all public symbols" }
+        out_items.push(&star)
+    }
+    var fns = tree.functions.as_slice()
+    for var i: i64 = 0; i < len(fns); i += 1 {
+        if fns[i].owner_struct == (~0 as u32) && fns[i].public {
+            var item = CompletionItem { label: span_text(&tree, fns[i].name), kind: 3, detail: line_slice_at(src, fns[i].name.offset) }
+            out_items.push(&item)
+        }
+    }
+    var structs = tree.structs.as_slice()
+    for var i: i64 = 0; i < len(structs); i += 1 {
+        if structs[i].public {
+            var sname = span_text(&tree, structs[i].name)
+            var item = CompletionItem { label: sname, kind: 22, detail: str.concat(arena, "struct ", sname) }
+            out_items.push(&item)
+        }
+    }
+    var enums = tree.enums.as_slice()
+    for var i: i64 = 0; i < len(enums); i += 1 {
+        if enums[i].public {
+            var ename = span_text(&tree, enums[i].name)
+            var item = CompletionItem { label: ename, kind: 13, detail: str.concat(arena, "enum ", ename) }
+            out_items.push(&item)
+        }
+    }
+    var traits = tree.traits.as_slice()
+    for var i: i64 = 0; i < len(traits); i += 1 {
+        if traits[i].public {
+            var tname = span_text(&tree, traits[i].name)
+            var item = CompletionItem { label: tname, kind: 8, detail: str.concat(arena, "trait ", tname) }
+            out_items.push(&item)
+        }
+    }
+    var consts = tree.consts.as_slice()
+    for var i: i64 = 0; i < len(consts); i += 1 {
+        if !consts[i].local && consts[i].public {
+            var item = CompletionItem { label: span_text(&tree, consts[i].name), kind: 21, detail: line_slice_at(src, consts[i].name.offset) }
+            out_items.push(&item)
+        }
+    }
+    return true
+}
+
+fun dots_to_slashes(arena: *mem.Arena, s: []u8): []u8 {
+    var rel = str.clone(arena, s)
+    var rbuf = data(rel) as *u8
+    for var i: i64 = 0; i < len(rel); i += 1 {
+        if rbuf[i] == '.' { rbuf[i] = '/' }
+    }
+    return rel
+}
+
 fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
                            line_off: u32, cursor_off: u32, out_items: *Vec[CompletionItem]): bool {
     var ls = line_off as i64
@@ -1225,6 +1296,26 @@ fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
     if len(trimmed) > 7 {
         rest = str.trim_left(trimmed[7..len(trimmed)])
     }
+    var lbrace = str.index_of(rest, '{')
+    if lbrace >= 0 {
+        var mod_part = str.trim(rest[0..lbrace])
+        if str.starts_with(mod_part, "std.") && len(ws.std_dir) > 0 {
+            var sub = dots_to_slashes(arena, mod_part[4..len(mod_part)])
+            var f = path.join(arena, ws.std_dir, str.concat(arena, sub, ".lunso"))
+            _ = add_module_file_symbols(arena, f, false, out_items)
+        } else if len(mod_part) > 0 {
+            var rel = dots_to_slashes(arena, mod_part)
+            var f1 = path.join(arena, path.dir_prefix(doc.path), str.concat(arena, rel, ".lunso"))
+            if !add_module_file_symbols(arena, f1, false, out_items) && len(ws.root_path) > 0 {
+                var f2 = path.join(arena, ws.root_path, str.concat(arena, rel, ".lunso"))
+                if !add_module_file_symbols(arena, f2, false, out_items) {
+                    var f3 = path.join(arena, path.join(arena, ws.root_path, "src"), str.concat(arena, rel, ".lunso"))
+                    _ = add_module_file_symbols(arena, f3, false, out_items)
+                }
+            }
+        }
+        return true
+    }
     var last_dot = str.last_index_of(rest, '.')
     if last_dot < 0 {
         if len(ws.std_dir) > 0 {
@@ -1234,33 +1325,39 @@ fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
         add_dir_completions(arena, path.dir_prefix(doc.path), out_items)
         if len(ws.root_path) > 0 {
             add_dir_completions(arena, ws.root_path, out_items)
+            add_dir_completions(arena, path.join(arena, ws.root_path, "src"), out_items)
         }
         return true
     }
 
     var mod_prefix = rest[0..last_dot]
-    var sub_dir: []u8 = ""
     if str.equals(mod_prefix, "std") {
-        sub_dir = ws.std_dir
-    } else if str.starts_with(mod_prefix, "std.") {
-        var sub = mod_prefix[4..len(mod_prefix)]
-        sub_dir = path.join(arena, ws.std_dir, sub)
-    } else {
-        var rel = str.clone(arena, mod_prefix)
-        // Replace '.' with '/'
-        var rbuf = data(rel) as *u8
-        for var i: i64 = 0; i < len(rel); i += 1 {
-            if rbuf[i] == '.' { rbuf[i] = '/' }
-        }
-        var doc_dir = path.dir_prefix(doc.path)
-        sub_dir = path.join(arena, doc_dir, rel)
-        add_dir_completions(arena, sub_dir, out_items)
-        if len(ws.root_path) > 0 {
-            add_dir_completions(arena, path.join(arena, ws.root_path, rel), out_items)
-        }
+        add_dir_completions(arena, ws.std_dir, out_items)
         return true
     }
+    if str.starts_with(mod_prefix, "std.") {
+        var sub = dots_to_slashes(arena, mod_prefix[4..len(mod_prefix)])
+        var sub_dir = path.join(arena, ws.std_dir, sub)
+        add_dir_completions(arena, sub_dir, out_items)
+        var mod_file = path.join(arena, ws.std_dir, str.concat(arena, sub, ".lunso"))
+        _ = add_module_file_symbols(arena, mod_file, true, out_items)
+        return true
+    }
+    var rel = dots_to_slashes(arena, mod_prefix)
+    var doc_dir = path.dir_prefix(doc.path)
+    var sub_dir = path.join(arena, doc_dir, rel)
     add_dir_completions(arena, sub_dir, out_items)
+    var f1 = path.join(arena, doc_dir, str.concat(arena, rel, ".lunso"))
+    if !add_module_file_symbols(arena, f1, true, out_items) && len(ws.root_path) > 0 {
+        add_dir_completions(arena, path.join(arena, ws.root_path, rel), out_items)
+        var f2 = path.join(arena, ws.root_path, str.concat(arena, rel, ".lunso"))
+        if !add_module_file_symbols(arena, f2, true, out_items) {
+            var src_dir = path.join(arena, ws.root_path, "src")
+            add_dir_completions(arena, path.join(arena, src_dir, rel), out_items)
+            var f3 = path.join(arena, src_dir, str.concat(arena, rel, ".lunso"))
+            _ = add_module_file_symbols(arena, f3, true, out_items)
+        }
+    }
     return true
 }
 

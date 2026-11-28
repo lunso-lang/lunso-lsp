@@ -501,6 +501,8 @@ class TestLunsoLsp(unittest.TestCase):
             doc_path = workdir / "features_06.lunso"
             uri = doc_path.as_uri()
             source = (
+                "import std.io\n"
+                "import std.io.\n"
                 "import std.collections { HashMap }\n"
                 "import std.mem\n"
                 "pub trait Printable {\n"
@@ -554,30 +556,36 @@ class TestLunsoLsp(unittest.TestCase):
             syms = {s["name"] for s in read_msg(proc.stdout)["result"]}
             self.assertTrue({"Printable", "Value", "eval_v", "main"}.issubset(syms))
 
-            # Hover on Value.Int (line 22: `    var v = Value.Int(42)`)
-            send({"jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": {"textDocument": {"uri": uri}, "position": {"line": 22, "character": 18}}})
+            # Hover on Value.Int (line 24: `    var v = Value.Int(42)`)
+            send({"jsonrpc": "2.0", "id": 3, "method": "textDocument/hover", "params": {"textDocument": {"uri": uri}, "position": {"line": 24, "character": 18}}})
             hv = read_msg(proc.stdout)["result"]
             self.assertIn("Int(i64)", hv["contents"]["value"])
 
-            # Definition on Value.Int jumps to line 7
-            send({"jsonrpc": "2.0", "id": 4, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 22, "character": 18}}})
+            # Definition on Value.Int jumps to line 9
+            send({"jsonrpc": "2.0", "id": 4, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 24, "character": 18}}})
             df = read_msg(proc.stdout)["result"]
-            self.assertEqual(df["range"]["start"]["line"], 7)
+            self.assertEqual(df["range"]["start"]["line"], 9)
 
-            # Completion after `Value.` (line 23: `    var x = Value.`)
-            send({"jsonrpc": "2.0", "id": 5, "method": "textDocument/completion", "params": {"textDocument": {"uri": uri}, "position": {"line": 23, "character": 18}}})
+            # Completion after `Value.` (line 25: `    var x = Value.`)
+            send({"jsonrpc": "2.0", "id": 5, "method": "textDocument/completion", "params": {"textDocument": {"uri": uri}, "position": {"line": 25, "character": 18}}})
             comp = {item["label"] for item in read_msg(proc.stdout)["result"]}
             self.assertEqual(comp, {"None", "Int"})
 
-            # Definition on `num` inside match arm (line 13: `            return num`) jumps to line 12
-            send({"jsonrpc": "2.0", "id": 6, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 13, "character": 20}}})
+            # Definition on `num` inside match arm (line 15: `            return num`) jumps to line 14
+            send({"jsonrpc": "2.0", "id": 6, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 15, "character": 20}}})
             df_num = read_msg(proc.stdout)["result"]
-            self.assertEqual(df_num["range"]["start"]["line"], 12)
+            self.assertEqual(df_num["range"]["start"]["line"], 14)
 
-            # Definition on struct method call `m.init(&a, 8)` (line 21: `    m.init(&a, 8)`) jumps to std/collections.lunso
-            send({"jsonrpc": "2.0", "id": 8, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 21, "character": 7}}})
+            # Definition on struct method call `m.init(&a, 8)` (line 23: `    m.init(&a, 8)`) jumps to std/collections.lunso
+            send({"jsonrpc": "2.0", "id": 8, "method": "textDocument/definition", "params": {"textDocument": {"uri": uri}, "position": {"line": 23, "character": 7}}})
             df_method = read_msg(proc.stdout)["result"]
             self.assertTrue(df_method["uri"].endswith("/std/collections.lunso"))
+
+            # Completion after `import std.io.` suggests exported symbols like println and *
+            send({"jsonrpc": "2.0", "id": 9, "method": "textDocument/completion", "params": {"textDocument": {"uri": uri}, "position": {"line": 1, "character": 14}}})
+            comp_imp = {item["label"] for item in read_msg(proc.stdout)["result"]}
+            self.assertIn("println", comp_imp)
+            self.assertIn("*", comp_imp)
 
             send({"jsonrpc": "2.0", "id": 7, "method": "shutdown", "params": None})
             self.assertIsNone(read_msg(proc.stdout)["result"])
