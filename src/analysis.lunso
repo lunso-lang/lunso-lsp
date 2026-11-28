@@ -1,11 +1,10 @@
 import std.file
 import std.fmt
-import std.map
+import std.collections { Vec, StrMap }
 import std.mem
 import std.os
 import std.path
 import std.str
-import std.vec
 import frontend.ast
 import frontend.modules
 import frontend.parser
@@ -20,8 +19,8 @@ pub struct Document {
 }
 
 pub struct Workspace {
-    docs: map.StrMap[Document]
-    uris: vec.Vec[[]u8]
+    docs: StrMap[Document]
+    uris: Vec[[]u8]
     arena: mem.Arena
     std_dir: []u8
     root_path: []u8
@@ -86,12 +85,7 @@ pub fun doc_open(ws: *Workspace, uri: []u8, text: []u8, version: i64): bool {
         return false
     }
     doc.uri = str.clone(&doc.arena, uri)
-    var decoded: []u8
-    if path.from_file_uri(&doc.arena, uri, &decoded) {
-        doc.path = decoded
-    } else {
-        doc.path = doc.uri
-    }
+    doc.path = path.from_file_uri(&doc.arena, uri) or doc.uri
     doc.text = str.clone(&doc.arena, text)
     if len(text) > 0 && len(doc.text) == 0 {
         doc.arena.deinit()
@@ -117,7 +111,7 @@ pub fun doc_close(ws: *Workspace, uri: []u8) {
     ws.docs.remove(uri)
 }
 
-fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *map.StrMap[[]u8]): bool {
+fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *StrMap[[]u8]): bool {
     if out.init(arena, 16) < 0 {
         return false
     }
@@ -132,7 +126,7 @@ fun build_overlays(arena: *mem.Arena, ws: *Workspace, out: *map.StrMap[[]u8]): b
     return true
 }
 
-fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out: *vec.Vec[[]u8]) {
+fun collect_include_dirs(arena: *mem.Arena, ws: *Workspace, doc_path: []u8, out: *Vec[[]u8]) {
     out.init(arena, 8)
     if len(ws.root_path) > 0 {
         out.push_value(ws.root_path)
@@ -154,12 +148,7 @@ fun offset_to_lsp(arena: *mem.Arena, prog: *modules.ModuleProgram, doc: *Documen
         var local_off = global_off - mf.start
         var slice = prog.tree.source[(mf.start as i64)..((mf.start + mf.length) as i64)]
         var pos = ast.offset_to_pos(slice, local_off)
-        var uri: []u8
-        if path.to_file_uri(arena, mf.path, &uri) {
-            *out_uri = uri
-        } else {
-            *out_uri = doc.uri
-        }
+        *out_uri = path.to_file_uri(arena, mf.path) or doc.uri
         *out_line = pos.line - 1
         *out_col = pos.col - 1
         return
@@ -173,13 +162,13 @@ fun run_frontend_text(arena: *mem.Arena, ws: *Workspace, doc: *Document, src_tex
                       prog: *modules.ModuleProgram, sem: *sema.Sema,
                       out_diag: *Diagnostic, has_diag: *bool): bool {
     *has_diag = false
-    var overlays: map.StrMap[[]u8]
+    var overlays: StrMap[[]u8]
     if !build_overlays(arena, ws, &overlays) {
         return false
     }
     overlays.set(doc.path, src_text)
 
-    var inc_dirs: vec.Vec[[]u8]
+    var inc_dirs: Vec[[]u8]
     collect_include_dirs(arena, ws, doc.path, &inc_dirs)
 
     prog.quiet = true
@@ -388,13 +377,14 @@ fun format_type(arena: *mem.Arena, sem: *sema.Sema, t: sema.SemaType, tree: *ast
         return str.concat3(arena, "[", nbuf[0..n], str.concat(arena, "]", format_type(arena, sem, et, tree)))
     }
     if t.kind == sema.TypeKind.Any { return "any" }
+    if t.kind == sema.TypeKind.Null { return "null" }
     if t.kind == sema.TypeKind.Result {
         var it = sem.elements.data[t.element_type as i64]
         return str.concat(arena, "!", format_type(arena, sem, it, tree))
     }
     if t.kind == sema.TypeKind.Func && (t.record as u64) < sem.func_types.len {
         var ft = &sem.func_types.data[t.record as i64]
-        var buf: vec.Vec[u8]
+        var buf: Vec[u8]
         buf.init(arena, 64)
         buf.append_slice("fun(")
         for var i: u64 = 0; i < ft.params.len; i += 1 {
@@ -434,7 +424,7 @@ fun format_fn_sig(arena: *mem.Arena, tree: *ast.Ast, sem: *sema.Sema, fn_idx: u3
         return str.trim(sig_line[0..brace])
     }
     var sf = sem.functions.data[fn_idx as i64]
-    var buf: vec.Vec[u8]
+    var buf: Vec[u8]
     buf.init(arena, 128)
     if fdecl.public { buf.append_slice("pub ") }
     buf.append_slice("fun ")
@@ -548,7 +538,7 @@ fun block_end_offset(src: []u8, open_pos: u32): u32 {
 }
 
 fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
-                          out_names: *vec.Vec[[]u8], out_offsets: *vec.Vec[u32], out_nodes: *vec.Vec[u32]) {
+                          out_names: *Vec[[]u8], out_offsets: *Vec[u32], out_nodes: *Vec[u32]) {
     var fdecl = tree.functions.data[fn_idx]
     var children = tree.children.as_slice()
     var nodes = tree.nodes.as_slice()
@@ -608,14 +598,16 @@ fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
             var bopen = nodes[nd.b as i64].pos
             var bend = block_end_offset(tree.source, bopen)
             if cursor_off >= bopen && cursor_off <= bend {
-                if h.index_name.length > 0 {
+                if h.index_name.length > 0 && !str.equals(span_text(tree, h.index_name), "_") {
                     out_names.push_value(span_text(tree, h.index_name))
                     out_offsets.push_value(h.index_name.offset)
                     out_nodes.push_value(nid)
                 }
-                out_names.push_value(span_text(tree, h.item_name))
-                out_offsets.push_value(h.item_name.offset)
-                out_nodes.push_value(nid)
+                if !str.equals(span_text(tree, h.item_name), "_") {
+                    out_names.push_value(span_text(tree, h.item_name))
+                    out_offsets.push_value(h.item_name.offset)
+                    out_nodes.push_value(nid)
+                }
             }
         } else if nd.kind == ast.AstKind.OrElse {
             var h = tree.or_elses.data[nd.a as i64]
@@ -634,9 +626,9 @@ fun collect_in_scope_locals(tree: *ast.Ast, fn_idx: i64, cursor_off: u32,
 
 fun find_local_at(tree: *ast.Ast, fn_idx: i64, cursor_off: u32, name: []u8,
                   out_off: *u32, out_nid: *u32): bool {
-    var names: vec.Vec[[]u8]
-    var offsets: vec.Vec[u32]
-    var nids: vec.Vec[u32]
+    var names: Vec[[]u8]
+    var offsets: Vec[u32]
+    var nids: Vec[u32]
     names.init(tree.nodes.arena, 16)
     offsets.init(tree.nodes.arena, 16)
     nids.init(tree.nodes.arena, 16)
@@ -778,15 +770,13 @@ fun resolve_import_at_cursor(arena: *mem.Arena, ws: *Workspace, doc: *Document,
             return true
         }
     }
-    if path.to_file_uri(arena, mf.path, out_uri) {
-        *out_line = 0
-        *out_col = 0
-        return true
-    }
-    return false
+    *out_uri = path.to_file_uri(arena, mf.path) or { return false }
+    *out_line = 0
+    *out_col = 0
+    return true
 }
 
-pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *vec.Vec[DocSymbol]): bool {
+pub fun document_symbols(arena: *mem.Arena, doc: *Document, out_syms: *Vec[DocSymbol]): bool {
     if out_syms.init(arena, 16) < 0 {
         return false
     }
@@ -1001,9 +991,9 @@ fun binding_completion_kind(k: ast.AstBindingKind): i64 {
     return 9
 }
 
-fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *vec.Vec[CompletionItem]) {
+fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *Vec[CompletionItem]) {
     if len(dir_path) == 0 { return }
-    var entries: vec.Vec[os.DirEntry]
+    var entries: Vec[os.DirEntry]
     if os.list_dir(dir_path, arena, &entries) < 0 {
         return
     }
@@ -1023,7 +1013,7 @@ fun add_dir_completions(arena: *mem.Arena, dir_path: []u8, out_items: *vec.Vec[C
 }
 
 fun complete_import_line(arena: *mem.Arena, ws: *Workspace, doc: *Document,
-                           line_off: u32, cursor_off: u32, out_items: *vec.Vec[CompletionItem]): bool {
+                           line_off: u32, cursor_off: u32, out_items: *Vec[CompletionItem]): bool {
     var ls = line_off as i64
     for ls > 0 && doc.text[ls - 1] != '\n' { ls -= 1 }
     var line_prefix = doc.text[ls..(cursor_off as i64)]
@@ -1117,7 +1107,7 @@ fun find_expr_before_dot(prog: *modules.ModuleProgram, sem: *sema.Sema, fn_idx: 
     return t.kind == sema.TypeKind.Struct
 }
 
-fun push_completion(out_items: *vec.Vec[CompletionItem], prefix: []u8, item: CompletionItem) {
+fun push_completion(out_items: *Vec[CompletionItem], prefix: []u8, item: CompletionItem) {
     if len(prefix) > 0 && !str.starts_with(item.label, prefix) {
         return
     }
@@ -1125,7 +1115,7 @@ fun push_completion(out_items: *vec.Vec[CompletionItem], prefix: []u8, item: Com
 }
 
 pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64, col0: u64,
-                   out_items: *vec.Vec[CompletionItem]): bool {
+                   out_items: *Vec[CompletionItem]): bool {
     if out_items.init(arena, 32) < 0 {
         return false
     }
@@ -1139,7 +1129,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     }
     var typed_prefix = src[pos..word_end]
 
-    var raw_items: vec.Vec[CompletionItem]
+    var raw_items: Vec[CompletionItem]
     raw_items.init(arena, 32)
     if complete_import_line(arena, ws, doc, local_off, local_off, &raw_items) {
         for var i: u64 = 0; i < raw_items.len; i += 1 {
@@ -1237,9 +1227,9 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
     var tree = &prog.tree
     var fn_idx = find_enclosing_fn(tree, local_off)
     if fn_idx >= 0 {
-        var lnames: vec.Vec[[]u8]
-        var loffs: vec.Vec[u32]
-        var lnids: vec.Vec[u32]
+        var lnames: Vec[[]u8]
+        var loffs: Vec[u32]
+        var lnids: Vec[u32]
         lnames.init(arena, 16)
         loffs.init(arena, 16)
         lnids.init(arena, 16)
@@ -1302,7 +1292,7 @@ pub fun completion(arena: *mem.Arena, ws: *Workspace, doc: *Document, line0: u64
 
 pub struct SignatureHelpInfo {
     label: []u8
-    params: vec.Vec[[]u8]
+    params: Vec[[]u8]
     active_param: i64
 }
 
@@ -1367,7 +1357,7 @@ fun find_enclosing_brace_struct(src: []u8, pos: i64, out_word: *[]u8, out_prefix
 
 fun build_struct_signature(arena: *mem.Arena, tree: *ast.Ast, sdecl: ast.AstStruct,
                            word: []u8, out: *SignatureHelpInfo, active: i64) {
-    var buf: vec.Vec[u8]
+    var buf: Vec[u8]
     buf.init(arena, 128)
     buf.append_slice("struct ")
     buf.append_slice(word)

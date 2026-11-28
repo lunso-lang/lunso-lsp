@@ -57,6 +57,7 @@
 
 ; Literals
 (boolean_literal) @boolean
+(null_literal) @constant.builtin
 (integer_literal) @number
 (float_literal) @number.float
 (string_literal) @string

@@ -1,2 +1,5 @@
 build/
 *.o
+
+zed/target/
+zed/extension.wasm

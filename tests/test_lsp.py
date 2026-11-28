@@ -60,7 +60,7 @@ class TestLunsoLsp(unittest.TestCase):
             uri = doc_path.as_uri()
             source = (
                 "import std.io\n"
-                "import std.vec\n"
+                "import std.collections { Vec }\n"
                 "import support.math\n"
                 "import \n"
                 "import std.\n"
@@ -88,7 +88,7 @@ class TestLunsoLsp(unittest.TestCase):
                 "    items[0].\n"
                 "    items[0].nested.\n"
                 "    unknown_var.\n"
-                "    var tokens: vec.Vec[Inner]\n"
+                "    var tokens: Vec[Inner]\n"
                 "    tokens.\n"
                 "    tokens.data[0].\n"
                 "    wrap.[Inner](tokens.data[0]).\n"
@@ -431,8 +431,8 @@ class TestLunsoLsp(unittest.TestCase):
                 "params": {"textDocument": {"uri": uri}, "position": {"line": 31, "character": 12}},
             })
             def_field = read_msg(proc.stdout)["result"]
-            self.assertTrue(def_field["uri"].endswith("/std/vec.lunso"))
-            self.assertEqual(def_field["range"]["start"]["line"], 3)
+            self.assertTrue(def_field["uri"].endswith("/std/collections.lunso"))
+            self.assertEqual(def_field["range"]["start"]["line"], 29)
 
             send({"jsonrpc": "2.0", "id": 8, "method": "shutdown", "params": None})
             self.assertIsNone(read_msg(proc.stdout)["result"])

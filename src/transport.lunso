@@ -3,7 +3,7 @@ import std.io
 import std.json
 import std.mem
 import std.str
-import std.vec
+import std.collections { Vec }
 
 pub fun read_message(arena: *mem.Arena, out: *[]u8): i32 {
     var header_buf: [1024]u8
@@ -89,8 +89,7 @@ pub fun send_response(arena: *mem.Arena, id: json.JsonValue, result: json.JsonVa
     if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
     if json.set(arena, &msg, "id", id) < 0 { return false }
     if json.set(arena, &msg, "result", result) < 0 { return false }
-    var body: []u8
-    if json.stringify(arena, msg, &body) < 0 { return false }
+    var body = json.stringify(arena, msg) or { return false }
     return write_message(arena, body)
 }
 
@@ -103,8 +102,7 @@ pub fun send_error(arena: *mem.Arena, id: json.JsonValue, code: i64, message: []
     if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
     if json.set(arena, &msg, "id", id) < 0 { return false }
     if json.set(arena, &msg, "error", err_obj) < 0 { return false }
-    var body: []u8
-    if json.stringify(arena, msg, &body) < 0 { return false }
+    var body = json.stringify(arena, msg) or { return false }
     return write_message(arena, body)
 }
 
@@ -114,7 +112,6 @@ pub fun send_notification(arena: *mem.Arena, method: []u8, params: json.JsonValu
     if json.set(arena, &msg, "jsonrpc", json.str_val("2.0")) < 0 { return false }
     if json.set(arena, &msg, "method", json.str_val(method)) < 0 { return false }
     if json.set(arena, &msg, "params", params) < 0 { return false }
-    var body: []u8
-    if json.stringify(arena, msg, &body) < 0 { return false }
+    var body = json.stringify(arena, msg) or { return false }
     return write_message(arena, body)
 }

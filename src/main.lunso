@@ -1,12 +1,11 @@
 import std.args
 import std.file
 import std.json
-import std.map
+import std.collections { Vec, StrMap }
 import std.mem
 import std.os
 import std.path
 import std.str
-import std.vec
 import analysis
 import transport
 
@@ -81,8 +80,8 @@ fun extract_position(params: json.JsonValue, out_uri: *[]u8, out_line: *u64, out
 fun handle_initialize(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonValue, params: json.JsonValue) {
     var root_uri: []u8
     if json.get_str(params, "rootUri", &root_uri) {
-        var rp: []u8
-        if path.from_file_uri(&ws.arena, root_uri, &rp) {
+        var rp = path.from_file_uri(&ws.arena, root_uri) or ""
+        if len(rp) > 0 {
             ws.root_path = rp
         }
     } else {
@@ -149,7 +148,7 @@ fun handle_document_symbol(arena: *mem.Arena, ws: *analysis.Workspace, id: json.
     if json.get(params, "textDocument", &td) &&
        json.get_str(td, "uri", &uri) &&
        ws.docs.get_ptr(uri, &doc) {
-        var syms: vec.Vec[analysis.DocSymbol]
+        var syms: Vec[analysis.DocSymbol]
         if analysis.document_symbols(arena, doc, &syms) {
             for var i: u64 = 0; i < syms.len; i += 1 {
                 var s = syms.data[i]
@@ -267,7 +266,7 @@ fun handle_completion(arena: *mem.Arena, ws: *analysis.Workspace, id: json.JsonV
     var arr: json.JsonValue
     json.array_val(arena, &arr)
     if extract_position(params, &uri, &line, &col) && ws.docs.get_ptr(uri, &doc) {
-        var items: vec.Vec[analysis.CompletionItem]
+        var items: Vec[analysis.CompletionItem]
         if analysis.completion(arena, ws, doc, line, col, &items) {
             for var i: u64 = 0; i < items.len; i += 1 {
                 var it = items.data[i]
@@ -343,13 +342,12 @@ fun main(): i32 {
 
     ws.std_dir = detect_std_dir(&ws.arena)
 
-    var cli_args: [][]u8
-    if args.load(&ws.arena, &cli_args) > 0 {
-        for var i: i64 = 1; i + 1 < len(cli_args); i += 1 {
-            if str.equals(cli_args[i], "--std") {
-                ws.std_dir = cli_args[i + 1]
-                i += 1
-            }
+    var empty_args: [][]u8
+    var cli_args = args.load(&ws.arena) or empty_args
+    for var i: i64 = 1; i + 1 < len(cli_args); i += 1 {
+        if str.equals(cli_args[i], "--std") {
+            ws.std_dir = cli_args[i + 1]
+            i += 1
         }
     }
 
@@ -371,8 +369,11 @@ fun main(): i32 {
             return 1
         }
 
-        var msg: json.JsonValue
-        if !json.parse(&req_arena, body, &msg) || msg.kind != json.JsonKind.Object {
+        var msg = json.parse(&req_arena, body) or {
+            req_arena.deinit()
+            continue
+        }
+        if msg.kind != json.JsonKind.Object {
             req_arena.deinit()
             continue
         }

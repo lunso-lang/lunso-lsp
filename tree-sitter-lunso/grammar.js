@@ -226,6 +226,7 @@ module.exports = grammar({
       $.return_statement,
       $.if_statement,
       $.match_statement,
+      $.match_type_statement,
       $.for_statement,
       $.break_statement,
       $.continue_statement,
@@ -257,6 +258,24 @@ module.exports = grammar({
       '{',
       repeat(seq($.match_arm, optional(';'))),
       '}',
+    ),
+
+    match_type_statement: $ => prec.dynamic(1, seq(
+      'match',
+      'type',
+      field('type', $._type),
+      '{',
+      repeat(seq($.match_type_arm, optional(';'))),
+      '}',
+    )),
+
+    match_type_arm: $ => seq(
+      choice(
+        'else',
+        seq($._type, repeat(seq(',', $._type))),
+      ),
+      '=>',
+      choice($.block, $._statement),
     ),
 
     match_arm: $ => seq(
@@ -310,6 +329,7 @@ module.exports = grammar({
       $.array_literal,
       $.parenthesized_expression,
       $.boolean_literal,
+      $.null_literal,
       $.integer_literal,
       $.float_literal,
       $.string_literal,
@@ -376,9 +396,16 @@ module.exports = grammar({
     call_expression: $ => prec.left(PREC.POSTFIX, seq(
       field('function', $._expression),
       '(',
-      optional(seq($._expression, repeat(seq(',', $._expression)), optional(','))),
+      optional(seq($._call_arg, repeat(seq(',', $._call_arg)), optional(','))),
       ')',
     )),
+
+    _call_arg: $ => choice(
+      $.spread_expression,
+      $._expression,
+    ),
+
+    spread_expression: $ => seq('...', $._expression),
 
     index_expression: $ => prec.left(PREC.POSTFIX, seq(
       field('object', $._expression),
@@ -435,6 +462,7 @@ module.exports = grammar({
     ),
 
     boolean_literal: _ => choice('true', 'false'),
+    null_literal: _ => 'null',
     identifier: _ => /[a-zA-Z_][a-zA-Z0-9_]*/,
     integer_literal: _ => choice(
       /0[xX][0-9a-fA-F]+/,
